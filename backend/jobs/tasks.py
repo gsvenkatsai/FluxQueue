@@ -2,6 +2,11 @@ from celery import shared_task
 from .models import Job, JobLog
 from django.utils import timezone
 import time
+
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+
+
 def handle_email(job):
     time.sleep(5)
     return {"status": "email sent to " + job.payload.get("to")}
@@ -31,16 +36,45 @@ def execute_job(job_id):
     job.status = 'RUNNING'
     job.started_at = timezone.now()
     job.save()
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(
+        f'job_{job_id}',    
+        {
+            'type': 'job_status_update',
+            'status': job.status,
+        }
+    )
     JobLog.objects.create(job=job,message='Job Started',level='INFO')
     JobLog.objects.create(job=job,message='Job Running',level='INFO')
 
-    # 2. run handler
-    handler = handlers.get(job.job_type)  # get the function
-    result = handler(job)     
+    try:
+        # 2. run handler
+        handler = handlers.get(job.job_type)  # get the function
+        result = handler(job)     
 
-    # 3. set COMPLETED + save result
-    job.status = 'COMPLETED'
-    job.result = result
-    job.completed_at = timezone.now()
-    job.save()
-    JobLog.objects.create(job=job,message='Job Finished',level='INFO')
+        # 3. set COMPLETED + save result
+        job.status = 'COMPLETED'
+        job.result = result
+        job.completed_at = timezone.now()
+        job.save()
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f'job_{job_id}',    
+            {
+                'type': 'job_status_update',
+                'status': job.status,
+            }
+        )
+        JobLog.objects.create(job=job,message='Job Finished',level='INFO')
+    except:
+        job.status = 'FAILED'
+        channel_layer = get_channel_layer()
+        job.save()
+        async_to_sync(channel_layer.group_send)(
+            f'job_{job_id}',    
+            {
+                'type': 'job_status_update',
+                'status': job.status,
+            }
+        )
+        JobLog.objects.create(job=job,message='Job Failed',level='ERROR')

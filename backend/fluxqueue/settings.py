@@ -120,7 +120,16 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-INSTALLED_APPS += ['rest_framework', 'jobs']
+INSTALLED_APPS += ['rest_framework', 'jobs', 'channels']
 
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+
+CHANNEL_LAYERS = {
+    'default':{
+        'BACKEND': 'channels_redis.core.RedisChannelLayer', 
+        'CONFIG':{
+            'hosts': [('127.0.0.1', 6379)]
+            }
+        }
+    }
