@@ -156,3 +156,34 @@
 
 - GET /api/jobs/ returns paginated list with subset fields
 - GET /api/jobs/:id/ returns full detail with 3 log entries (Job Started, Job Running, Job Finished)
+
+## Job Handlers
+
+### What I did
+
+- Wrote 4 handler functions: handle_email (5s), handle_pdf (10s), handle_image (3s), handle_export (7s)
+- Each handler reads from job.payload and returns a result dict
+- Used dict-based routing in execute_job to call correct handler based on job.job_type
+- Saved handler return value to job.result (JSONB field)
+
+### Why dict routing over elif
+
+- Cleaner — adding a new job type means adding one line to the dict, not another elif branch
+- handler = handlers.get(job.job_type) gets the function, result = handler(job) calls it
+
+### Flow
+
+- payload = input to job (e.g. {"to": "test@example.com"})
+- result = output from handler (e.g. {"status": "email sent to test@example.com"})
+
+### Verification
+
+- Tested all 4 job types via Postman
+- result field populated correctly in GET /api/jobs/:id/
+- Logs showing: Job Started, Job Running, Job Finished
+
+## Layer 1 Complete
+
+- Full lifecycle working: submit → PENDING → RUNNING → COMPLETED
+- Logs tracked at each step
+- Result stored per job type
