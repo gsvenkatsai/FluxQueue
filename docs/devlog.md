@@ -90,3 +90,28 @@
 - Created celery.py and configured Celery app
 - Linked Celery with Django settings
 - Enabled task auto-discovery
+
+## Job submission API + Celery execution
+
+### What I did
+
+- Created JobSerializer for Job model
+- Implemented POST /api/jobs/ API using APIView
+- Saved job with status = PENDING
+- Triggered Celery task using `.delay(str(job.id))`
+- Implemented execute_job task to update:
+  - status → RUNNING → COMPLETED
+  - timestamps (started_at, completed_at)
+
+### Fix
+
+- Fixed issue where Celery was not updating DB due to incorrect job_id handling - restart the workers they dont pick up the changes
+- Ensured UUID passed as string → `.delay(str(job.id))`
+
+### Verification
+
+- API returns 201 with job data
+- Celery worker logs show task received and executed
+- Verified in DataGrip:
+  - status updates correctly
+  - timestamps updated
