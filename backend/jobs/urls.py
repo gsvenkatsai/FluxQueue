@@ -1,5 +1,6 @@
 from django.urls import path
-from .views import JobSubmitView
+from .views import JobDetailView, JobView
 urlpatterns = [
-    path('jobs/', JobSubmitView.as_view())
-]
+    path('jobs/', JobView.as_view()),
+    path('jobs/<uuid:pk>/', JobDetailView.as_view())
+]   

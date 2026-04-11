@@ -115,3 +115,44 @@
 - Verified in DataGrip:
   - status updates correctly
   - timestamps updated
+
+## List + Detail API
+
+### Plan
+
+- GET /api/jobs/ — paginated list of all jobs
+- GET /api/jobs/:id/ — single job with all fields + nested logs
+
+### Problem: Two serializers, one endpoint
+
+- List view should return subset of fields (id, job_type, status, timestamps) — avoid sending large JSONB payload/result for every row
+- Detail view should return all fields + nested logs
+- POST and GET on same /api/jobs/ endpoint needed different serializers
+
+### Why ListCreateAPIView
+
+- APIView required manual get() and post() logic — too verbose
+- ListCreateAPIView handles GET (list) and POST (create) on same endpoint automatically
+- Overrode get_serializer_class() to return JobListSerializer for GET and JobSerializer for POST — clean separation without duplicating logic
+
+### Why get_serializer_class()
+
+- Can't set one serializer_class when GET and POST need different ones
+- get_serializer_class() lets you conditionally return the right serializer based on request.method
+
+### Nested logs
+
+- JobDetailSerializer needed to return logs array inside job response
+- Added logs = JobLogSerializer(many=True, read_only=True) field
+- Requires related_name='logs' on JobLog FK — Django uses this to do job.logs.all() internally
+- read_only=True prevents DRF from trying to write logs during job creation
+
+### Problem: Logs showing empty []
+
+- Celery worker was running old code without JobLog.objects.create() calls
+- Fix: always restart Celery worker after changing task code — it does not hot reload
+
+### Verification
+
+- GET /api/jobs/ returns paginated list with subset fields
+- GET /api/jobs/:id/ returns full detail with 3 log entries (Job Started, Job Running, Job Finished)
