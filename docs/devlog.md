@@ -68,3 +68,25 @@
 
 - Initial confusion: migrations showed “No migrations to apply”
 - Reason: migrations were already applied in PostgreSQL
+
+## Job + JobLog models
+
+### What I did
+
+- Defined Job model with UUID primary key and status tracking
+- Defined JobLog model linked via ForeignKey
+- Created migration (0001_initial)
+- Applied migrations to PostgreSQL
+
+### Verification
+
+- Checked migration status using showmigrations → applied
+- Verified tables in DB: jobs_job, jobs_joblog
+
+## Celery basic setup
+
+### What I did
+
+- Created celery.py and configured Celery app
+- Linked Celery with Django settings
+- Enabled task auto-discovery
