@@ -24,3 +24,10 @@ cd ~/fluxqueue/backend
 source venv/bin/activate
 daphne -p 8000 fluxqueue.asgi:application
 exec bash"
+
+# 5. Celery beat
+gnome-terminal -- bash -c "
+cd ~/fluxqueue/backend
+source venv/bin/activate
+celery -A fluxqueue beat --loglevel=info
+exec bash"

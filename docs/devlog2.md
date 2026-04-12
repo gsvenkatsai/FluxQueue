@@ -268,17 +268,80 @@ celery -A fluxqueue worker --loglevel=info
 
 ---
 
+## Refactor: Modular tasks.py
+
+Extracted handler functions to `jobs/handlers.py`.
+Added three helper functions to eliminate repeated `group_send` boilerplate:
+
+```python
+def send_ws(group_name, data):
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(group_name, data)
+
+def send_status(job_id, status):
+    send_ws(f'job_{job_id}', {'type': 'job_status_update', 'status': status})
+
+def send_log(job_id, joblog):
+    send_ws(f'job_{job_id}', {
+        'type': 'job_log_update',
+        'log': {
+            'message': joblog.message,
+            'level': joblog.level,
+            'created_at': str(joblog.created_at)
+        }
+    })
+```
+
+`execute_job` now calls `send_status()` and `send_log()` — clean and readable.
+
+---
+
+## S6: Worker Heartbeat
+
+Every 10 seconds, Celery beat triggers `worker_heartbeat` which sends to `workers` group:
+
+```python
+@shared_task
+def worker_heartbeat():
+    send_ws('workers', {
+        'type': 'worker_status_update',
+        'status': 'ACTIVE',
+    })
+```
+
+Celery beat schedule in `settings.py`:
+
+```python
+CELERY_BEAT_SCHEDULE = {
+    'worker-heartbeat': {
+        'task': 'jobs.tasks.worker_heartbeat',
+        'schedule': 10.0,
+    },
+}
+```
+
+Browser connected to `ws/workers/` receives `{status: 'ACTIVE'}` every 10 seconds.
+If heartbeats stop → worker is offline. Dashboard uses this to detect dead workers.
+
+Run beat separately from worker:
+
+```bash
+celery -A fluxqueue beat --loglevel=info
+```
+
+---
+
 ## What's Left in Layer 2
 
-- [ ] S5: Stream JobLog entries via WebSocket in real time
-- [ ] S6: Worker heartbeat every 10s to `workers` group
+- [x] S5: Log streaming via WebSocket ✅
+- [x] S6: Worker heartbeat every 10s ✅
 - [ ] S8: React frontend — replace polling with WebSocket
 
 ---
 
-## Status: S1–S4, S7 Complete ✅
-
 ## How RUNNING and COMPLETED Appeared in the Browser Console
+
+Three files, three steps:
 
 **Step 1 — Celery sends to Redis (`tasks.py`)**
 
@@ -289,27 +352,48 @@ async_to_sync(channel_layer.group_send)(
 )
 ```
 
-After setting `job.status = 'RUNNING'`, Celery calls `group_send`.
-This writes the message to Redis under group `job_<uuid>`.
-`async_to_sync` is needed because Celery is sync but `group_send` is async.
+After setting `job.status = 'RUNNING'` and saving to DB, Celery calls `group_send`.
+This writes the message to Redis under the group `job_<uuid>`.
+`async_to_sync` is needed because Celery is synchronous but `group_send` is async.
 
-**Step 2 — Django Channels forwards to browser (`consumers.py`)**
+**Step 2 — Django Channels reads from Redis, forwards to browser (`consumers.py`)**
 
 ```python
 async def job_status_update(self, event):
     await self.send(text_data=json.dumps({'status': event['status']}))
 ```
 
-Channels listens on Redis, finds all browsers in group `job_<uuid>`, calls `job_status_update()`.
-Method name must match the `type` field sent in Step 1.
+Django Channels is always listening on Redis.
+When it sees a message for group `job_<uuid>`, it finds all connected browsers in that group.
+It calls `job_status_update()` on the consumer — the method name must match the `type` field sent in Step 1.
+`self.send()` pushes the message down the open WebSocket connection to the browser.
 
-**Step 3 — Browser receives it**
+**Step 3 — Browser receives it (console)**
 
 ```javascript
-const ws = new WebSocket("ws://127.0.0.1:8000/ws/jobs/new-uuid-id/");
 ws.onmessage = (e) => console.log(JSON.parse(e.data));
 // → {status: 'RUNNING'}
 // → {status: 'COMPLETED'}
 ```
 
-No request made — server pushed it the instant Celery called `group_send`.
+The browser's `onmessage` handler fires every time the server pushes data.
+No request was made — the server pushed it the instant Celery called `group_send`.
+
+---
+
+## Live Test Result ✅
+
+Submitted `pdf_generate` job via Django REST Framework UI.
+Connected WebSocket immediately after with the job UUID.
+Browser console received:
+
+```
+{status: 'RUNNING'}
+{status: 'COMPLETED'}
+```
+
+No polling. No page refresh. Pure WebSocket push from Celery → Redis → Django Channels → Browser.
+
+---
+
+## Status: S1–S7 Complete ✅
