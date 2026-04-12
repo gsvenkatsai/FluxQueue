@@ -31,7 +31,7 @@ def execute_job(job_id):
     'data_export': handle_export,
     }
     job = Job.objects.get(id=job_id)
-
+    time.sleep(10)
     # 1. set RUNNING
     job.status = 'RUNNING'
     job.started_at = timezone.now()
@@ -48,10 +48,12 @@ def execute_job(job_id):
     JobLog.objects.create(job=job,message='Job Running',level='INFO')
 
     try:
+        time.sleep(10)
         # 2. run handler
         handler = handlers.get(job.job_type)  # get the function
         result = handler(job)     
 
+        time.sleep(10)
         # 3. set COMPLETED + save result
         job.status = 'COMPLETED'
         job.result = result
