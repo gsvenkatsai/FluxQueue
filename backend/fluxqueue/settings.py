@@ -133,3 +133,12 @@ CHANNEL_LAYERS = {
             }
         }
     }
+
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    'worker-heartbeat': {
+        'task': 'jobs.tasks.worker_heartbeat',
+        'schedule': 10.0,  # every 10 seconds
+    },
+}
