@@ -142,3 +142,11 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 10.0,  # every 10 seconds
     },
 }
+
+INSTALLED_APPS += ['corsheaders']
+
+MIDDLEWARE = ['corsheaders.middleware.CorsMiddleware'] + MIDDLEWARE
+
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+]

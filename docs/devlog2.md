@@ -331,11 +331,175 @@ celery -A fluxqueue beat --loglevel=info
 
 ---
 
-## What's Left in Layer 2
+## S8: React Frontend (Vite + TypeScript + Bootstrap)
 
-- [x] S5: Log streaming via WebSocket ✅
-- [x] S6: Worker heartbeat every 10s ✅
-- [ ] S8: React frontend — replace polling with WebSocket
+### Setup
+
+```bash
+npm create vite@latest fluxqueue -- --template react-ts
+cd fluxqueue
+npm install react-router-dom bootstrap axios
+```
+
+Add to `main.tsx`:
+
+```tsx
+import "bootstrap/dist/css/bootstrap.min.css";
+```
+
+### CORS Fix
+
+React runs on `localhost:5173`, Django on `8000` — different origins, so browser blocks requests.
+
+Install `django-cors-headers`:
+
+```bash
+pip install django-cors-headers
+```
+
+In `settings.py`:
+
+```python
+INSTALLED_APPS += ['corsheaders']
+MIDDLEWARE = ['corsheaders.middleware.CorsMiddleware'] + MIDDLEWARE
+CORS_ALLOWED_ORIGINS = ['http://localhost:5173']
+```
+
+### Routing (`src/router.tsx`)
+
+```tsx
+import { createBrowserRouter } from "react-router-dom";
+import JobList from "./pages/JobList";
+import JobDetail from "./pages/JobDetail";
+
+const router = createBrowserRouter([
+  { path: "/", element: <JobList /> },
+  { path: "/jobs/:id", element: <JobDetail /> },
+]);
+export default router;
+```
+
+---
+
+### `JobList.tsx`
+
+Fetches all jobs on load, displays in a Bootstrap table with color-coded status badges.
+Has a form to submit new jobs — `job_type` dropdown + `to` input.
+On submit, prepends new job to list without refetching.
+Clicking a row navigates to `/jobs/:id`.
+
+Key state:
+
+```tsx
+const [jobs, setJobs] = useState<Job[]>([]);
+const [showForm, setShowForm] = useState(false);
+```
+
+Submit handler:
+
+```tsx
+const handleSubmit = () => {
+  axios.post<Job>("http://127.0.0.1:8000/api/jobs/", job).then((res) => {
+    setJobs([res.data, ...jobs]);
+    setShowForm(false);
+  });
+};
+```
+
+---
+
+### `JobDetail.tsx`
+
+The core of Layer 2 — replaces polling with WebSocket.
+
+Two data sources on this page:
+
+1. `axios.get` on mount — fetches existing job + logs from DB
+2. WebSocket — receives live updates as job runs
+
+```tsx
+useEffect(() => {
+  const ws = new WebSocket(`ws://127.0.0.1:8000/ws/jobs/${id}/`);
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.status) {
+      setJob((prev) => (prev ? { ...prev, status: data.status } : prev));
+    } else if (data.log) {
+      setLogs((prev) => [...prev, data.log]);
+    }
+  };
+
+  axios.get<Job>(`http://127.0.0.1:8000/api/jobs/${id}/`).then((res) => {
+    setJob(res.data);
+    setLogs(res.data.logs); // load existing logs
+  });
+
+  return () => ws.close(); // cleanup on unmount
+}, []);
+```
+
+**How to distinguish message types:**
+
+- `data.status` present → status update → update job state
+- `data.log` present → log entry → append to logs array
+
+Displays: job type, status badge, payload, logs list with level badges and timestamps.
+
+---
+
+## Layer 2 Complete ✅
+
+All 8 steps done:
+
+- S1: Channels + Daphne installed
+- S2: Redis channel layer configured
+- S3: JobStatusConsumer + WorkerStatusConsumer
+- S4: Celery sends status updates via group_send
+- S5: Log streaming — every JobLog pushed via WebSocket
+- S6: Worker heartbeat every 10s via Celery beat
+- S7: WebSocket URL routing
+- S8: React frontend — no polling anywhere
+
+---
+
+## How to Test WebSocket from Browser Console
+
+Open any page in the browser, press F12 → Console, and run:
+
+**Test job status + logs:**
+
+```javascript
+// 1. Submit a job via Postman or UI, copy the UUID
+// 2. Connect to that job's WebSocket
+const ws = new WebSocket("ws://127.0.0.1:8000/ws/jobs/<job-uuid>/");
+ws.onopen = () => console.log("connected");
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+```
+
+You will see messages appear as the job runs:
+
+```
+{status: 'PENDING'}
+{status: 'RUNNING'}
+{log: {level: 'INFO', message: 'Job Started', created_at: '...'}}
+{log: {level: 'INFO', message: 'Job Running', created_at: '...'}}
+{status: 'COMPLETED'}
+{log: {level: 'INFO', message: 'Job Finished', created_at: '...'}}
+```
+
+**Test worker heartbeat:**
+
+```javascript
+const ws = new WebSocket("ws://127.0.0.1:8000/ws/workers/");
+ws.onmessage = (e) => console.log(JSON.parse(e.data));
+// Every 10 seconds:
+// {status: 'ACTIVE'}
+```
+
+**Important:** Connect WebSocket BEFORE or IMMEDIATELY after submitting the job.
+If the job finishes before you connect, you will only see the last message.
+Use `pdf_generate` (10s) for easier timing.
 
 ---
 
@@ -396,4 +560,4 @@ No polling. No page refresh. Pure WebSocket push from Celery → Redis → Djang
 
 ---
 
-## Status: S1–S7 Complete ✅
+## Status: S1–S4, S7 Complete ✅
