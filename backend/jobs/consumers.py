@@ -15,6 +15,12 @@ class JobStatusConsumer(AsyncWebsocketConsumer):
             'status': event['status'],
         }))
 
+    async def job_log_update(self, event):
+        await self.send(text_data=json.dumps({
+            'log': event['log'],
+        }))
+         
+
 class WorkerStatusConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.group_name = f'workers'
