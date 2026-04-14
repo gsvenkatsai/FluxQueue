@@ -17,6 +17,9 @@ class JobView(ListCreateAPIView):
         return JobListSerializer
     def post(self, request):
         serializer = JobSerializer(data=request.data)
+        old_job = Job.objects.filter(idempotency_key = request.data.get('idempotency_key')).first()
+        if(old_job is not None and old_job.status!='FAILED'):
+            return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
         if serializer.is_valid():
             job = serializer.save()
             execute_job.delay(str(job.id))
