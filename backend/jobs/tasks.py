@@ -6,7 +6,7 @@ from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 import time
 from celery import current_task
-
+from django_redis import get_redis_connection
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -26,43 +26,54 @@ def send_log(job_id, joblog):
 
 @shared_task
 def execute_job(job_id):
-    time.sleep(10)
-    handlers = {
-    'email_send': handle_email,
-    'pdf_generate': handle_pdf,
-    'image_resize': handle_image,
-    'data_export': handle_export,
-    }
-    job = Job.objects.get(id=job_id)
-    send_status(job_id, job.status)
-    # 1. set RUNNING
-    job.status = 'RUNNING'
-    job.started_at = timezone.now()
-    job.save()
-    send_status(job_id, job.status)
-    joblog = JobLog.objects.create(job=job,message='Job Started',level='INFO')
-    send_log(job_id, joblog)
-    joblog = JobLog.objects.create(job=job,message='Job Running',level='INFO')
-    send_log(job_id, joblog)
+    redis_client = get_redis_connection("default")
+    
+    lock_key = f"lock:job:{job_id}"
+    lock_acquired = redis_client.set(lock_key, 1, nx=True, ex=300)
+    
+    if not lock_acquired:
+        return
+    
     try:
-        # 2. run handler
-        handler = handlers.get(job.job_type)  # get the function
-        result = handler(job)     
+        time.sleep(10)
+        handlers = {
+        'email_send': handle_email,
+        'pdf_generate': handle_pdf,
+        'image_resize': handle_image,
+        'data_export': handle_export,
+        }
+        job = Job.objects.get(id=job_id)
+        send_status(job_id, job.status)
+        # 1. set RUNNING
+        job.status = 'RUNNING'
+        job.started_at = timezone.now()
+        job.save()
+        send_status(job_id, job.status)
+        joblog = JobLog.objects.create(job=job,message='Job Started',level='INFO')
+        send_log(job_id, joblog)
+        joblog = JobLog.objects.create(job=job,message='Job Running',level='INFO')
+        send_log(job_id, joblog)
+        try:
+            # 2. run handler
+            handler = handlers.get(job.job_type)  # get the function
+            result = handler(job)     
 
-        # 3. set COMPLETED + save result
-        job.status = 'COMPLETED'
-        job.result = result
-        job.completed_at = timezone.now()
-        job.save()
-        send_status(job_id, job.status)
-        joblog =  JobLog.objects.create(job=job,message='Job Finished',level='INFO')
-        send_log(job_id, joblog)
-    except:
-        job.status = 'FAILED'
-        job.save()
-        send_status(job_id, job.status)
-        joblog = JobLog.objects.create(job=job,message='Job Failed',level='ERROR')
-        send_log(job_id, joblog)
+            # 3. set COMPLETED + save result
+            job.status = 'COMPLETED'
+            job.result = result
+            job.completed_at = timezone.now()
+            job.save()
+            send_status(job_id, job.status)
+            joblog =  JobLog.objects.create(job=job,message='Job Finished',level='INFO')
+            send_log(job_id, joblog)
+        except:
+            job.status = 'FAILED'
+            job.save()
+            send_status(job_id, job.status)
+            joblog = JobLog.objects.create(job=job,message='Job Failed',level='ERROR')
+            send_log(job_id, joblog)
+    finally:
+        redis_client.delete(lock_key)
 
 @shared_task
 def worker_heartbeat():

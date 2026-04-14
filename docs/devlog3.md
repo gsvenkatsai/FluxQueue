@@ -26,3 +26,212 @@ Idempotency key prevents duplicate job creation on retry.
 - First POST with key → 201 Created
 - Second POST with same key → 200 OK, same job returned
 - No duplicate in DB
+
+# FluxQueue — Devlog
+
+## Layer 3, Step 2: Atomic Job Pickup with Redis Distributed Lock
+
+**Date:** April 14, 2026
+**Status:** ✅ Complete
+
+---
+
+## What Was Built
+
+Implemented a Redis-based distributed lock using `SET NX EX` to guarantee that only one Celery worker can execute a given job at a time, regardless of how many workers are running concurrently.
+
+---
+
+## The Problem This Solves
+
+Without a lock, a race condition is possible:
+
+1. Two Celery workers are idle, both blocking on Redis with `BLPOP`
+2. One job enters the queue
+3. Both workers receive the same `job_id` simultaneously
+4. Both call `execute_job("same-job-id")`
+5. Both set `status = RUNNING` in the DB — no error, no conflict
+6. Both execute the handler — **two emails sent, two PDFs generated, two DB rows inserted**
+
+This is a correctness bug. The system appears to work but silently produces duplicate side effects.
+
+---
+
+## The Fix: Redis `SET NX EX`
+
+Before touching the DB, each worker attempts to acquire a distributed lock:
+
+```
+SET lock:job:{job_id} 1 NX EX 300
+```
+
+- `NX` — Only set if the key does **not** exist (atomic in Redis)
+- `EX 300` — Auto-expire after 300 seconds (safety net)
+
+Redis processes this atomically. Only one worker can win. The loser gets `None` and exits silently.
+
+---
+
+## Code
+
+### `tasks.py` — Full Implementation
+
+```python
+from celery import shared_task
+from .models import Job, JobLog
+from django.utils import timezone
+from .handlers import handle_email, handle_pdf, handle_image, handle_export
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+from django_redis import get_redis_connection
+from celery import current_task
+import time
+
+
+def send_ws(group_name, data):
+    channel_layer = get_channel_layer()
+    async_to_sync(channel_layer.group_send)(group_name, data)
+
+
+def send_status(job_id, status):
+    send_ws(f'job_{job_id}', {'type': 'job_status_update', 'status': status})
+
+
+def send_log(job_id, joblog):
+    send_ws(f'job_{job_id}', {
+        'type': 'job_log_update',
+        'log': {
+            'message': joblog.message,
+            'level': joblog.level,
+            'created_at': str(joblog.created_at)
+        }
+    })
+
+
+@shared_task
+def execute_job(job_id):
+    redis_client = get_redis_connection("default")
+
+    lock_key = f"lock:job:{job_id}"
+    lock_acquired = redis_client.set(lock_key, 1, nx=True, ex=300)
+
+    if not lock_acquired:
+        return  # Another worker already has this job — exit silently
+
+    try:
+        handlers = {
+            'email_send': handle_email,
+            'pdf_generate': handle_pdf,
+            'image_resize': handle_image,
+            'data_export': handle_export,
+        }
+
+        job = Job.objects.get(id=job_id)
+        send_status(job_id, job.status)
+
+        # Set RUNNING
+        job.status = 'RUNNING'
+        job.started_at = timezone.now()
+        job.save()
+        send_status(job_id, job.status)
+
+        JobLog.objects.create(job=job, message='Job Started', level='INFO')
+        JobLog.objects.create(job=job, message='Job Running', level='INFO')
+
+        try:
+            handler = handlers.get(job.job_type)
+            if not handler:
+                raise ValueError(f"Unknown job_type: {job.job_type}")
+
+            result = handler(job)
+
+            job.status = 'COMPLETED'
+            job.result = result
+            job.completed_at = timezone.now()
+            job.save()
+            send_status(job_id, job.status)
+            joblog = JobLog.objects.create(job=job, message='Job Finished', level='INFO')
+            send_log(job_id, joblog)
+
+        except Exception as e:
+            job.status = 'FAILED'
+            job.save()
+            send_status(job_id, job.status)
+            joblog = JobLog.objects.create(job=job, message=f'Job Failed: {str(e)}', level='ERROR')
+            send_log(job_id, joblog)
+
+    finally:
+        redis_client.delete(lock_key)  # Always release lock, even if job crashed
+```
+
+### `settings.py` — Redis Cache Config
+
+```python
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
+    }
+}
+```
+
+> Note: Redis DB `/1` used for cache. Celery broker runs on DB `/0` to avoid key collisions.
+
+---
+
+## Key Design Decisions
+
+### Why `finally` and not just end of `try`?
+
+If the job handler raises an unhandled exception, `finally` still executes. Without it, the lock key stays in Redis for 300 seconds — no other worker can pick up that job until expiry.
+
+### Why `EX 300` if `finally` deletes it anyway?
+
+`finally` only runs if the Python process is alive. If the worker process is killed (OOM, `kill -9`, server crash), `finally` never runs. The `EX 300` expiry is the safety net — after 5 minutes, the lock auto-releases and another worker can retry the job.
+
+### Why silent `return` when lock not acquired?
+
+The job is already being handled by another worker. There's no error — this is expected behavior under concurrent execution. Raising an exception would mark the Celery task as failed, which is misleading.
+
+### Why `SET NX` is safe from race conditions
+
+`SET NX EX` is atomic in Redis. Redis is single-threaded for command processing. No two workers can both see the key as absent and both succeed — Redis serializes the commands.
+
+---
+
+## Dependencies Added
+
+```bash
+pip install django-redis
+```
+
+Added to `requirements.txt`.
+
+---
+
+## What Happens in Each Scenario
+
+| Scenario                                          | Behavior                                                        |
+| ------------------------------------------------- | --------------------------------------------------------------- |
+| Worker 1 acquires lock, completes job             | `finally` deletes lock. Clean.                                  |
+| Worker 2 tries same job while Worker 1 holds lock | Gets `None`, returns silently.                                  |
+| Worker 1 crashes mid-job                          | `finally` never runs. Lock expires after 300s.                  |
+| Unknown `job_type` submitted                      | Raises `ValueError`, caught by inner `except`, status → FAILED. |
+| Two workers start simultaneously                  | One wins `NX`, other exits. DB gets exactly one RUNNING entry.  |
+
+---
+
+## Interview Answer
+
+**Q: How do you prevent two workers from executing the same job?**
+
+Before touching the DB, each worker attempts `SET lock:job:{job_id} 1 NX EX 300` in Redis. `NX` makes this atomic — only one worker can set the key. The loser gets `None` and exits immediately. The winner holds the lock for the duration of execution. `finally` deletes it on completion. The `EX 300` expiry handles the case where the worker process dies before `finally` runs.
+
+---
+
+## Next
+
+Layer 3 S3 — Exponential backoff retry with jitter.
