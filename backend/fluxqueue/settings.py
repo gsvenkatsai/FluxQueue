@@ -159,4 +159,13 @@ CACHES = {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
         }
     }
+}   
+
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    'detect-zombie-jobs': {
+        'task': 'jobs.tasks.detect_zombie_jobs',
+        'schedule': 300,  # every 5 minutes
+    },
 }

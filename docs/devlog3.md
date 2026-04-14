@@ -399,3 +399,58 @@ except SoftTimeLimitExceeded:
 - `jobs/models.py` — added timeout_seconds field
 - `jobs/views.py` — apply_async in JobView.post and JobRequeueView.post
 - `jobs/tasks.py` — SoftTimeLimitExceeded handler, removed dead line
+
+## Layer 3 — S7: Zombie Job Detection
+
+**Date:** 2026-04-14
+
+### What was built
+
+- Celery Beat scheduled task `detect_zombie_jobs()` runs every 5 minutes
+- Queries all RUNNING jobs where `started_at + timeout_seconds < now()`
+- Marks zombies as PENDING, logs worker_crash, re-dispatches via apply_async
+- Beat schedule configured in settings.py
+
+### Key decisions
+
+- Celery Beat over a separate cron — keeps everything in the Celery ecosystem
+- Re-dispatch with `apply_async` to preserve `soft_time_limit`
+- `error_msg = 'worker_crash'` distinguishes zombie recovery from normal retry
+
+### Code changes
+
+**tasks.py**
+
+```python
+@shared_task
+def detect_zombie_jobs():
+    running_jobs = Job.objects.filter(status='RUNNING')
+
+    for job in running_jobs:
+        deadline = job.started_at + timedelta(seconds=job.timeout_seconds)
+        if deadline < timezone.now():
+            job.status = 'PENDING'
+            job.error_msg = 'worker_crash'
+            job.save()
+            JobLog.objects.create(job=job, level='WARNING', message='Zombie detected — requeuing')
+            send_status(str(job.id), 'PENDING')
+            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+```
+
+**settings.py**
+
+```python
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    'detect-zombie-jobs': {
+        'task': 'jobs.tasks.detect_zombie_jobs',
+        'schedule': 300,  # every 5 minutes
+    },
+}
+```
+
+### Files changed
+
+- `jobs/tasks.py` — added detect_zombie_jobs task
+- `fluxqueue/settings.py` — added CELERY_BEAT_SCHEDULE

@@ -11,6 +11,10 @@ import time
 from celery import current_task
 from django_redis import get_redis_connection
 from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
+
+from django.utils import timezone
+from datetime import timedelta
+
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -108,3 +112,18 @@ def worker_heartbeat():
         'worker': current_task.request.hostname,
         'status': 'ACTIVE',
     })  
+
+
+@shared_task
+def detect_zombie_jobs():
+    running_jobs = Job.objects.filter(status='RUNNING')
+    
+    for job in running_jobs:
+        deadline = job.started_at + timedelta(seconds=job.timeout_seconds)
+        if deadline < timezone.now():
+            job.status = 'PENDING'
+            job.error_msg = 'worker_crash'
+            job.save()
+            JobLog.objects.create(job=job, level='WARNING', message='Zombie detected — requeuing')
+            send_status(str(job.id), 'PENDING')
+            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
