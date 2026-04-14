@@ -1,3 +1,5 @@
+import random
+
 from celery import shared_task
 from .models import Job, JobLog
 from django.utils import timezone
@@ -7,6 +9,7 @@ from asgiref.sync import async_to_sync
 import time
 from celery import current_task
 from django_redis import get_redis_connection
+from celery.exceptions import MaxRetriesExceededError
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -24,8 +27,8 @@ def send_log(job_id, joblog):
         }
     })
 
-@shared_task
-def execute_job(job_id):
+@shared_task(bind=True)
+def execute_job(self, job_id):
     redis_client = get_redis_connection("default")
     
     lock_key = f"lock:job:{job_id}"
@@ -66,12 +69,24 @@ def execute_job(job_id):
             send_status(job_id, job.status)
             joblog =  JobLog.objects.create(job=job,message='Job Finished',level='INFO')
             send_log(job_id, joblog)
-        except:
+
+        except MaxRetriesExceededError:
             job.status = 'FAILED'
             job.save()
             send_status(job_id, job.status)
-            joblog = JobLog.objects.create(job=job,message='Job Failed',level='ERROR')
+            joblog = JobLog.objects.create(job=job,message='Max retries exceeded',level='ERROR')
             send_log(job_id, joblog)
+
+        except Exception as exc:
+            job.retry_count += 1
+            wait = min(60 * 2**job.retry_count, 3600)
+            wait += random.uniform(0, 30)
+            job.status = 'PENDING'
+            job.save()
+            send_status(job_id, job.status)
+            joblog = JobLog.objects.create(job=job,message='Job Retrying',level='WARNING')
+            send_log(job_id, joblog)
+            raise self.retry(countdown=wait, max_retries=3, exc=exc)
     finally:
         redis_client.delete(lock_key)
 

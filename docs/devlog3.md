@@ -234,4 +234,50 @@ Before touching the DB, each worker attempts `SET lock:job:{job_id} 1 NX EX 300`
 
 ## Next
 
-Layer 3 S3 — Exponential backoff retry with jitter.
+# Layer 3 S3 — Exponential Backoff Retry with Jitter
+
+**Date:** 2026-04-14
+
+## What I built
+
+Retry logic for failed jobs with exponential backoff and jitter to prevent thundering herd.
+
+## Changes
+
+**tasks.py**
+
+- Added `bind=True` to `@shared_task` decorator, `self` as first arg
+- Two except blocks:
+  - `MaxRetriesExceededError` → status=FAILED, log ERROR "Max retries exceeded"
+  - `Exception` → increment retry_count, calculate wait, status=PENDING, log WARNING "Job Retrying", raise self.retry()
+
+## Key formulas
+
+```python
+wait = min(60 * 2**job.retry_count, 3600)  # exponential, capped at 1hr
+wait += random.uniform(0, 30)               # jitter prevents thundering herd
+raise self.retry(countdown=wait, max_retries=3, exc=exc)
+```
+
+## Why each decision
+
+- **Exponential backoff** — gives overloaded downstream (DB, API) breathing room between retries
+- **Cap at 3600** — no point waiting more than 1 hour
+- **Jitter** — without it, all workers retry at the same moment → thundering herd hammers DB again
+- **max_retries=3** — balances persistence vs resource waste
+
+## Test result
+
+- Submitted email_send job with forced Exception
+- Celery logs showed 3 retries with increasing delays (~10s, ~20s, ~40s)
+- Final status: FAILED
+- JobLogs: INFO "Job Started" → WARNING "Job Retrying" (×3) → ERROR "Max retries exceeded"
+- retry_count: 3 ✓
+
+## Concepts for interview
+
+Q: Why exponential backoff?
+A: Fixed retry interval constantly hammers an already-overloaded system. Exponential backoff gives it progressively more time to recover.
+
+Q: What is thundering herd?
+A: When many workers all fail simultaneously and retry at the same fixed interval — they all hit the system at once. Jitter randomizes retry timing, spreading the load.
