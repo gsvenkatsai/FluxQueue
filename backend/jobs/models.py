@@ -7,6 +7,7 @@ class Job(models.Model):
         ('RUNNING', 'Running'),
         ('COMPLETED', 'Completed'),
         ('FAILED', 'Failed'),
+        ('DEAD', 'Dead'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -34,4 +35,11 @@ class JobLog(models.Model):
     job = models.ForeignKey(Job, on_delete=models.CASCADE, related_name='logs')
     level = models.CharField(max_length=20, choices=LEVEL_CHOICES, default='INFO')
     message = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class JobDLQ(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job = models.ForeignKey(Job, on_delete=models.CASCADE, related_name='dlq_entries')
+    failure_reason = models.TextField(null=True, blank=True)
+    error_trace = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

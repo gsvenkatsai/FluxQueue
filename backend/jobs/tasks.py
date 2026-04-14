@@ -1,7 +1,8 @@
 import random
+import traceback
 
 from celery import shared_task
-from .models import Job, JobLog
+from .models import Job, JobDLQ, JobLog
 from django.utils import timezone
 from .handlers import handle_email, handle_pdf, handle_image, handle_export
 from channels.layers import get_channel_layer
@@ -40,53 +41,58 @@ def execute_job(self, job_id):
     try:
         time.sleep(10)
         handlers = {
-        'email_send': handle_email,
-        'pdf_generate': handle_pdf,
-        'image_resize': handle_image,
-        'data_export': handle_export,
+            'email_send': handle_email,
+            'pdf_generate': handle_pdf,
+            'image_resize': handle_image,
+            'data_export': handle_export,
         }
         job = Job.objects.get(id=job_id)
         send_status(job_id, job.status)
-        # 1. set RUNNING
         job.status = 'RUNNING'
         job.started_at = timezone.now()
         job.save()
         send_status(job_id, job.status)
-        joblog = JobLog.objects.create(job=job,message='Job Started',level='INFO')
+        joblog = JobLog.objects.create(job=job, message='Job Started', level='INFO')
         send_log(job_id, joblog)
-        joblog = JobLog.objects.create(job=job,message='Job Running',level='INFO')
+        joblog = JobLog.objects.create(job=job, message='Job Running', level='INFO')
         send_log(job_id, joblog)
         try:
-            # 2. run handler
-            handler = handlers.get(job.job_type)  # get the function
-            result = handler(job)     
-
-            # 3. set COMPLETED + save result
+            handler = handlers.get(job.job_type)
+            result = handler(job)
             job.status = 'COMPLETED'
             job.result = result
             job.completed_at = timezone.now()
             job.save()
             send_status(job_id, job.status)
-            joblog =  JobLog.objects.create(job=job,message='Job Finished',level='INFO')
-            send_log(job_id, joblog)
-
-        except MaxRetriesExceededError:
-            job.status = 'FAILED'
-            job.save()
-            send_status(job_id, job.status)
-            joblog = JobLog.objects.create(job=job,message='Max retries exceeded',level='ERROR')
+            joblog = JobLog.objects.create(job=job, message='Job Finished', level='INFO')
             send_log(job_id, joblog)
 
         except Exception as exc:
             job.retry_count += 1
-            wait = min(60 * 2**job.retry_count, 3600)
-            wait += random.uniform(0, 30)
+            job.save()
+
+            if self.request.retries >= 2:
+                job.status = 'DEAD'
+                job.save()
+                JobDLQ.objects.create(
+                    job=job,
+                    failure_reason=str(exc),
+                    error_trace=str(traceback.format_exc())
+                )
+                send_status(job_id, 'DEAD')
+                joblog = JobLog.objects.create(job=job, message='Job is Dead', level='ERROR')
+                send_log(job_id, joblog)
+                return
+
+            wait = min(5 * 2**job.retry_count, 3600) + random.uniform(0, 30)
             job.status = 'PENDING'
             job.save()
             send_status(job_id, job.status)
-            joblog = JobLog.objects.create(job=job,message='Job Retrying',level='WARNING')
+            joblog = JobLog.objects.create(job=job, message='Job Retrying', level='WARNING')
             send_log(job_id, joblog)
+            redis_client.delete(lock_key)
             raise self.retry(countdown=wait, max_retries=3, exc=exc)
+
     finally:
         redis_client.delete(lock_key)
 

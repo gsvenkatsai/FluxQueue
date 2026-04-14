@@ -1,8 +1,9 @@
-from rest_framework.generics import ListCreateAPIView, RetrieveAPIView
+from rest_framework.generics import ListCreateAPIView, RetrieveAPIView, ListAPIView
+from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Job
-from .serializers import JobSerializer, JobListSerializer, JobDetailSerializer
+from .models import Job, JobDLQ
+from .serializers import JobDLQSerializer, JobSerializer, JobListSerializer, JobDetailSerializer
 from .tasks import execute_job
   
 class JobDetailView(RetrieveAPIView):
@@ -25,4 +26,21 @@ class JobView(ListCreateAPIView):
             execute_job.delay(str(job.id))
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
+
+class JobDLQView(ListAPIView):
+    queryset = JobDLQ.objects.all()
+    serializer_class = JobDLQSerializer
+
+class JobRequeueView(APIView):
+    def post(self, request, pk):
+        try:
+            jobdlq = JobDLQ.objects.get(id=pk)
+            jobdlq.job.status = 'PENDING'
+            jobdlq.job.retry_count = 0
+            jobdlq.job.save()
+            job = jobdlq.job
+            jobdlq.delete()
+            execute_job.delay(str(job.id))
+            return Response(JobSerializer(job).data, status=status.HTTP_201_CREATED)
+        except JobDLQ.DoesNotExist :
+            return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)

@@ -19,14 +19,14 @@ celery -A fluxqueue worker --loglevel=info
 exec bash"
 
 # 4. Celery beat
-gnome-terminal -- bash -c "
-cd ~/fluxqueue/backend
-source venv/bin/activate
-celery -A fluxqueue beat --loglevel=info
-exec bash"
+# gnome-terminal -- bash -c "
+# cd ~/fluxqueue/backend
+# source venv/bin/activate
+# celery -A fluxqueue beat --loglevel=info
+# exec bash"
 
 # 5. React frontend
-gnome-terminal -- bash -c "
-cd ~/fluxqueue/frontend/fluxqueue
-npm run dev
-exec bash"
+# gnome-terminal -- bash -c "
+# cd ~/fluxqueue/frontend/fluxqueue
+# npm run dev
+# exec bash"

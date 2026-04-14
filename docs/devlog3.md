@@ -281,3 +281,65 @@ A: Fixed retry interval constantly hammers an already-overloaded system. Exponen
 
 Q: What is thundering herd?
 A: When many workers all fail simultaneously and retry at the same fixed interval — they all hit the system at once. Jitter randomizes retry timing, spreading the load.
+
+# Layer 3 S4 — Dead Letter Queue
+
+**Date:** 2026-04-14
+
+## What I built
+
+Dead Letter Queue for permanently failed jobs — separate table, list API,
+and requeue endpoint.
+
+## Changes
+
+**models.py**
+
+- Added `JobDLQ` model: `id` (UUID), `job` (FK), `failure_reason`,
+  `error_trace`, `created_at`
+
+**tasks.py**
+
+- Moved `MaxRetriesExceededError` to outer try block (was incorrectly
+  nested inside inner try)
+- On max retries exceeded: set `job.status = 'DEAD'`, create `JobDLQ`
+  entry with `failure_reason=str(exc)` and `error_trace=traceback.format_exc()`
+- Added `import traceback`
+
+**serializers.py**
+
+- Added `JobDLQSerializer` with nested `JobSerializer` for FK job details
+
+**views.py**
+
+- `JobDLQView` — `GET /api/jobs/dlq/` lists all dead jobs
+- `JobRequeueView` — `POST /api/jobs/dlq/:id/requeue/` resets job and
+  re-executes
+
+**urls.py**
+
+- Added DLQ routes above `<uuid:pk>` to prevent URL conflict
+
+## Key decisions
+
+- **Separate table** — keeps main jobs table clean, allows dedicated
+  tooling for dead jobs
+- **Reset retry_count=0** on requeue — gives job a fresh 3 attempts
+- **Delete DLQ entry** on requeue — job is no longer dead
+- **FK not copy** — avoids data duplication, job details accessible via FK
+
+## Test results
+
+- Forced `email_send` to always raise Exception
+- Job retried 3 times → status=DEAD → JobDLQ entry created ✓
+- `GET /api/jobs/dlq/` returned dead job with failure_reason + error_trace ✓
+- Fixed handler → `POST requeue/` → job re-executed → COMPLETED ✓
+- `GET /api/jobs/dlq/` → entry gone ✓
+
+## Interview Q
+
+Q: What is a Dead Letter Queue?
+A: A separate store for jobs that exhausted all retries. Keeps failed jobs
+out of the main queue, allows manual inspection, root cause analysis, and
+safe requeue after fixing the underlying issue. Never delete failed jobs —
+they're debugging gold.

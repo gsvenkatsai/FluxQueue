@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Job, JobLog
+from .models import Job, JobDLQ, JobLog
 
 class JobLogSerializer(serializers.ModelSerializer):
     class Meta:
@@ -26,4 +26,10 @@ class JobDetailSerializer(serializers.ModelSerializer):
     logs = JobLogSerializer(many=True, read_only=True)
     class Meta:
         model = Job
+        fields = '__all__'
+
+class JobDLQSerializer(serializers.ModelSerializer):
+    job =  JobSerializer(read_only=True)
+    class Meta:
+        model = JobDLQ
         fields = '__all__'
