@@ -343,3 +343,59 @@ A: A separate store for jobs that exhausted all retries. Keeps failed jobs
 out of the main queue, allows manual inspection, root cause analysis, and
 safe requeue after fixing the underlying issue. Never delete failed jobs —
 they're debugging gold.
+
+## Layer 3 — S6: Timeout Handling
+
+**Date:** 2026-04-14
+
+### What was built
+
+- Added `timeout_seconds` field (IntegerField, default=15, nullable) to Job model
+- Replaced `execute_job.delay()` with `apply_async(soft_time_limit=job.timeout_seconds)`
+  in JobView and JobRequeueView
+- Added `SoftTimeLimitExceeded` handler in `execute_job` task
+- Safe re-fetch of job inside except block to handle timeout before DB fetch
+- Removed dead `self.soft_time_limit` line from task
+
+### Key decisions
+
+- Soft limit over hard limit — allows cleanup (status update, logging) before exit
+- `apply_async` at dispatch site so Celery knows the limit before task starts
+- Re-fetch job in except block to avoid NameError if timeout hits early
+
+### Code changes
+
+**models.py**
+
+```python
+timeout_seconds = models.IntegerField(null=True, default=15, blank=True)
+```
+
+**views.py**
+
+```python
+# JobView.post
+execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+
+# JobRequeueView.post
+execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+```
+
+**tasks.py**
+
+```python
+except SoftTimeLimitExceeded:
+    job = Job.objects.get(id=job_id)
+    job.status = 'FAILED'
+    job.error_msg = 'timeout'
+    job.completed_at = timezone.now()
+    job.save()
+    send_status(job_id, 'FAILED')
+    JobLog.objects.create(job=job, level='ERROR', message='Job timed out')
+```
+
+### Files changed
+
+- `jobs/models.py` — added timeout_seconds field
+- `jobs/views.py` — apply_async in JobView.post and JobRequeueView.post
+- `jobs/tasks.py` — SoftTimeLimitExceeded handler, removed dead line
