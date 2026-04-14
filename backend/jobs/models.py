@@ -21,6 +21,7 @@ class Job(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     idempotency_key = models.UUIDField(unique=True,null=True, blank=True, default=None)
+    timeout_seconds = models.IntegerField(null=True,default=15,blank=True)
     def __str__(self):
         return f"{self.job_type} - {self.status}"
 

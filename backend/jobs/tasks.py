@@ -10,7 +10,7 @@ from asgiref.sync import async_to_sync
 import time
 from celery import current_task
 from django_redis import get_redis_connection
-from celery.exceptions import MaxRetriesExceededError
+from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -92,7 +92,12 @@ def execute_job(self, job_id):
             send_log(job_id, joblog)
             redis_client.delete(lock_key)
             raise self.retry(countdown=wait, max_retries=3, exc=exc)
-
+    except SoftTimeLimitExceeded:
+        job = Job.objects.get(id=job_id) 
+        job.status = 'FAILED'
+        job.error_msg = 'timeout'
+        job.save()
+        JobLog.objects.create(job=job, level='ERROR', message='Job timed out')    
     finally:
         redis_client.delete(lock_key)
 

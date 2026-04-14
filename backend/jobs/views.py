@@ -23,7 +23,7 @@ class JobView(ListCreateAPIView):
             return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
         if serializer.is_valid():
             job = serializer.save()
-            execute_job.delay(str(job.id))
+            execute_job.apply_async((job.id,), soft_time_limit=job.timeout_seconds)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -40,7 +40,7 @@ class JobRequeueView(APIView):
             jobdlq.job.save()
             job = jobdlq.job
             jobdlq.delete()
-            execute_job.delay(str(job.id))
+            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
             return Response(JobSerializer(job).data, status=status.HTTP_201_CREATED)
         except JobDLQ.DoesNotExist :
             return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)
