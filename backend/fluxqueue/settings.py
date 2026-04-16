@@ -26,7 +26,8 @@ SECRET_KEY = 'django-insecure-90#pm_b*lacogj*vt!9ri$8ljm6-^ir&h75a$z-79=lx*uxkr*
 DEBUG = True
 
 ALLOWED_HOSTS = []
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # Application definition
 
@@ -169,3 +170,5 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 300,  # every 5 minutes
     },
 }
+import os
+CHAOS_MODE = os.environ.get('CHAOS_MODE', 'False') == 'True'

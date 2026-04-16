@@ -7,7 +7,7 @@ from django.utils import timezone
 from .handlers import handle_email, handle_pdf, handle_image, handle_export
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
-import time
+
 from celery import current_task
 from django_redis import get_redis_connection
 from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
@@ -43,7 +43,6 @@ def execute_job(self, job_id):
         return
     
     try:
-        time.sleep(10)
         handlers = {
             'email_send': handle_email,
             'pdf_generate': handle_pdf,
