@@ -11,7 +11,7 @@ def handle_email(job):
     return {"status": "email sent to " + job.payload.get("to")}
 def handle_pdf(job):
     may_be_choas()
-    time.sleep(10)
+    time.sleep(30)
     return {"status": "pdf generated " + job.payload.get("doc")}
 
 def handle_image(job):
