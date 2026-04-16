@@ -116,3 +116,105 @@ celery -A fluxqueue worker --loglevel=info
 | Second fault | Retries after ~10-70s                                        |
 | Third fault  | Marked DEAD, written to JobDLQ                               |
 | DLQ requeue  | POST /api/jobs/dlq/:id/requeue/ — manually requeue after fix |
+
+---
+
+## S2: Kill Worker Mid-Job (Zombie Detection)
+
+### What it is
+
+Worker process killed while job is mid-execution. Job stays stuck in `RUNNING`
+forever. Zombie detection cron identifies it, marks it `PENDING`, and requeues.
+
+---
+
+### How it works internally
+
+1. Job submitted → status set to `RUNNING`, `started_at` recorded in DB
+2. Worker killed with cold shutdown (`kill -9` or triple `Ctrl+C`)
+3. Job stays stuck in `RUNNING` — no one left to update it
+4. `detect_zombie_jobs` Celery beat task runs every 5 min (or triggered manually)
+5. Queries all `RUNNING` jobs where `started_at + timeout_seconds < now()`
+6. Marks job `PENDING`, sets `error_msg='worker_crash'`
+7. Requeues via `execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)`
+8. Restarted worker picks it up and completes normally
+
+---
+
+### Key Code
+
+**`jobs/tasks.py` — zombie detection**
+
+```python
+@shared_task
+def detect_zombie_jobs():
+    running_jobs = Job.objects.filter(status='RUNNING')
+
+    for job in running_jobs:
+        deadline = job.started_at + timedelta(seconds=job.timeout_seconds)
+        if deadline < timezone.now():
+            job.status = 'PENDING'
+            job.error_msg = 'worker_crash'
+            job.save()
+            JobLog.objects.create(job=job, level='WARNING', message='Zombie detected — requeuing')
+            send_status(str(job.id), 'PENDING')
+            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+```
+
+**`jobs/tasks.py` — SoftTimeLimitExceeded handler**
+
+```python
+except SoftTimeLimitExceeded:
+    job = Job.objects.get(id=job_id)
+    job.status = 'FAILED'
+    job.error_msg = 'timeout'
+    job.save()
+    JobLog.objects.create(job=job, level='ERROR', message='Job timed out')
+```
+
+---
+
+### Observed Output
+
+```
+# Before zombie detection
+status=RUNNING, error_msg=None, started_at=2026-04-16 19:32:18
+
+# After detect_zombie_jobs triggered + worker restarted
+status=COMPLETED, error_msg=worker_crash, started_at=2026-04-16 19:34:23
+```
+
+---
+
+### How to Reproduce
+
+```bash
+# 1. Change handle_pdf sleep to 30s temporarily
+# 2. Submit job:
+# {"job_type": "pdf_generate", "payload": {"doc": "kill-test.pdf"}, "timeout_seconds": 60}
+
+# 3. Confirm RUNNING in DB
+python manage.py shell -c "from jobs.models import Job; j = Job.objects.filter(job_type='pdf_generate').last(); print(j.status)"
+
+# 4. Hard kill Celery worker (Ctrl+C three times)
+
+# 5. Trigger zombie detection manually
+celery -A fluxqueue call jobs.tasks.detect_zombie_jobs
+
+# 6. Restart worker
+celery -A fluxqueue worker --loglevel=info
+
+# 7. Confirm recovery
+python manage.py shell -c "from jobs.models import Job; j = Job.objects.filter(job_type='pdf_generate').last(); print(j.status, j.error_msg)"
+```
+
+---
+
+### Recovery Path
+
+| Scenario                  | What happens                                                             |
+| ------------------------- | ------------------------------------------------------------------------ |
+| Worker killed mid-job     | Job stuck in `RUNNING`                                                   |
+| Zombie detection triggers | Job set to `PENDING`, `error_msg=worker_crash`                           |
+| Worker restarted          | Job requeued and completes normally                                      |
+| Timeout exceeded          | Job marked `FAILED` with `error_msg=timeout` via `SoftTimeLimitExceeded` |
