@@ -5,7 +5,7 @@ from rest_framework import status
 from .models import Job, JobDLQ
 from .serializers import JobDLQSerializer, JobSerializer, JobListSerializer, JobDetailSerializer
 from .tasks import execute_job
-  
+from celery.exceptions import OperationalError
 class JobDetailView(RetrieveAPIView):
     queryset = Job.objects.all()
     serializer_class = JobDetailSerializer
@@ -18,12 +18,19 @@ class JobView(ListCreateAPIView):
         return JobListSerializer
     def post(self, request):
         serializer = JobSerializer(data=request.data)
-        old_job = Job.objects.filter(idempotency_key = request.data.get('idempotency_key')).first()
-        if(old_job is not None and old_job.status!='FAILED'):
+        old_job = Job.objects.filter(idempotency_key=request.data.get('idempotency_key')).first()
+        if old_job is not None and old_job.status != 'FAILED':
             return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
         if serializer.is_valid():
             job = serializer.save()
-            execute_job.apply_async((job.id,), soft_time_limit=job.timeout_seconds)
+            try:
+                execute_job.apply_async((job.id,), soft_time_limit=job.timeout_seconds)
+            except (OperationalError, RuntimeError):
+                job.delete()
+                return Response(
+                    {"error": "queue_unavailable", "detail": "Redis is unreachable. Try again later."},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE
+                )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
