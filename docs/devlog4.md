@@ -333,3 +333,120 @@ scanning `PENDING` jobs older than N minutes and requeuing them. Not implemented
 
 📊 ~87% context remaining
 ```
+
+````markdown
+## S4: Force DLQ Demo
+
+### What it is
+
+A job handler that always raises an exception. Used to demo the full DLQ flow
+live — 3 retries with exponential backoff, job lands in DLQ, manually requeued.
+
+---
+
+### How it works internally
+
+1. `handle_dlq_test` raises `Exception("Forced failure for DLQ demo")` unconditionally
+2. `execute_job` catches the exception — increments `retry_count`, sets status back to `PENDING`
+3. Exponential backoff calculated: `wait = min(5 * 2**retry_count, 3600) + random.uniform(0, 30)`
+4. Celery schedules retry after `wait` seconds
+5. After `self.request.retries >= 2` (3 total attempts) — job marked `DEAD`
+6. `JobDLQ` entry created with `failure_reason` and full `error_trace`
+7. POST /api/jobs/dlq/:id/requeue/ resets `retry_count=0`, status=`PENDING`, deletes DLQ entry, requeues
+
+---
+
+### Key Code
+
+**`jobs/handlers.py`**
+
+```python
+def handle_dlq_test(job):
+    raise Exception("Forced failure for DLQ demo")
+```
+````
+
+**`jobs/tasks.py` — retry + DLQ logic**
+
+```python
+except Exception as exc:
+    job.retry_count += 1
+    job.save()
+
+    if self.request.retries >= 2:
+        job.status = 'DEAD'
+        job.save()
+        JobDLQ.objects.create(
+            job=job,
+            failure_reason=str(exc),
+            error_trace=str(traceback.format_exc())
+        )
+        send_status(job_id, 'DEAD')
+        joblog = JobLog.objects.create(job=job, message='Job is Dead', level='ERROR')
+        send_log(job_id, joblog)
+        return
+
+    wait = min(5 * 2**job.retry_count, 3600) + random.uniform(0, 30)
+    job.status = 'PENDING'
+    job.save()
+    raise self.retry(countdown=wait, max_retries=3, exc=exc)
+```
+
+---
+
+### Observed Output
+
+```
+Task execute_job[c2ed9ed9] retry: Retry in 35.42s: Exception('Forced failure for DLQ demo')
+Task execute_job[c11ffef1] retry: Retry in 30.79s: Exception('Forced failure for DLQ demo')
+# 3rd attempt — no retry, job marked DEAD
+
+Status: DEAD
+Retry count: 3
+Failure reason: Forced failure for DLQ demo
+```
+
+---
+
+### How to Reproduce
+
+```bash
+# 1. Submit dlq_test job via Postman
+# POST /api/jobs/
+# {
+#   "job_type": "dlq_test",
+#   "payload": {"test": "dlq"},
+#   "timeout_seconds": 30,
+#   "idempotency_key": "<uuid>"
+# }
+
+# 2. Watch Celery logs — 3 retries with increasing backoff delays
+# 3. Confirm DEAD status in DB
+python manage.py shell -c "
+from jobs.models import Job, JobDLQ
+job = Job.objects.filter(job_type='dlq_test').last()
+print('Status:', job.status)
+print('Retry count:', job.retry_count)
+dlq = JobDLQ.objects.filter(job=job).first()
+print('Failure reason:', dlq.failure_reason)
+"
+
+# 4. Requeue from DLQ
+# POST /api/jobs/dlq/:id/requeue/
+```
+
+---
+
+### Recovery Path
+
+| Scenario       | What happens                                                         |
+| -------------- | -------------------------------------------------------------------- |
+| First failure  | Retries after ~35s                                                   |
+| Second failure | Retries after ~40s                                                   |
+| Third failure  | Marked `DEAD`, written to `JobDLQ` with failure reason + error trace |
+| DLQ requeue    | POST /api/jobs/dlq/:id/requeue/ — resets retry_count, requeues job   |
+
+```
+
+📊 ~87% context remaining
+```
