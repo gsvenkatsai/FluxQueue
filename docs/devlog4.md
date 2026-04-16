@@ -218,3 +218,118 @@ python manage.py shell -c "from jobs.models import Job; j = Job.objects.filter(j
 | Zombie detection triggers | Job set to `PENDING`, `error_msg=worker_crash`                           |
 | Worker restarted          | Job requeued and completes normally                                      |
 | Timeout exceeded          | Job marked `FAILED` with `error_msg=timeout` via `SoftTimeLimitExceeded` |
+
+````markdown
+## S3: Redis Down Simulation
+
+### What it is
+
+Redis container stopped while system is running. Tests whether the API fails
+gracefully with a clean 503 instead of crashing with a raw 500 RuntimeError.
+
+---
+
+### How it works internally
+
+1. Redis container stopped via `docker stop fluxqueue-redis-1`
+2. POST /api/jobs/ received — `serializer.is_valid()` passes, job saved to DB as `PENDING`
+3. `execute_job.apply_async()` attempts to push job ID to Redis broker
+4. Celery raises `RuntimeError` — retry limit exceeded while trying to reconnect to result store
+5. View catches `(OperationalError, RuntimeError)` — deletes the phantom PENDING job from DB
+6. Returns `503 Service Unavailable` with structured error JSON
+7. Redis restarted — next submission returns `201` immediately, no manual recovery needed
+
+---
+
+### Key Code
+
+**`jobs/views.py`**
+
+```python
+from celery.exceptions import OperationalError
+
+# Inside JobView.post(), wrapping apply_async:
+try:
+    execute_job.apply_async((job.id,), soft_time_limit=job.timeout_seconds)
+except (OperationalError, RuntimeError):
+    job.delete()
+    return Response(
+        {"error": "queue_unavailable", "detail": "Redis is unreachable. Try again later."},
+        status=status.HTTP_503_SERVICE_UNAVAILABLE
+    )
+```
+````
+
+---
+
+### Observed Output
+
+```
+# Redis down — submission attempt
+HTTP 503 Service Unavailable
+{
+    "error": "queue_unavailable",
+    "detail": "Redis is unreachable. Try again later."
+}
+
+# Redis restarted — resubmission
+HTTP 201 Created
+{
+    "id": "33c57cbe-746b-413a-9bde-a089fe5b20bb",
+    "job_type": "email_send",
+    "status": "PENDING",
+    "payload": {"to": "test@example.com"},
+    "retry_count": 0,
+    "error_msg": null,
+    "created_at": "2026-04-16T19:55:05.970670Z"
+}
+```
+
+---
+
+### How to Reproduce
+
+```bash
+# 1. Confirm system is healthy — submit one job, confirm 201
+# 2. Stop Redis
+docker stop fluxqueue-redis-1
+
+# 3. Submit job via Postman
+# POST /api/jobs/
+# {
+#   "job_type": "email_send",
+#   "payload": {"to": "test@example.com"},
+#   "timeout_seconds": 30,
+#   "idempotency_key": "<uuid>"
+# }
+# Expect: 503 with queue_unavailable
+
+# 4. Restart Redis
+docker start fluxqueue-redis-1
+
+# 5. Resubmit same or new job — expect 201, job completes normally
+```
+
+---
+
+### Recovery Path
+
+| Scenario                                      | What happens                                                                   |
+| --------------------------------------------- | ------------------------------------------------------------------------------ |
+| Redis down, job submitted                     | `apply_async` raises `RuntimeError`, phantom job deleted from DB, 503 returned |
+| Redis restarted                               | Next submission works immediately, no manual intervention needed               |
+| Jobs already `PENDING` before Redis went down | Sit in DB unaffected, picked up by worker once broker reconnects               |
+
+---
+
+### Known Gap
+
+If the process dies after `job.save()` but before entering the try/except block,
+the job stays `PENDING` in DB permanently. Zombie detection only scans `RUNNING`
+jobs — stale `PENDING` jobs are invisible to it. Mitigation: a Celery beat task
+scanning `PENDING` jobs older than N minutes and requeuing them. Not implemented yet.
+
+```
+
+📊 ~87% context remaining
+```
