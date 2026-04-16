@@ -1,7 +1,8 @@
 import time
 import random
 from django.conf import settings
-
+def handle_dlq_test(job):
+    raise Exception("Forced failure for DLQ demo")
 def may_be_choas():
     if settings.CHAOS_MODE and random.random() < 0.3:
         raise Exception("Chaos : random fault injected")

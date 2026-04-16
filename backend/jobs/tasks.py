@@ -4,7 +4,7 @@ import traceback
 from celery import shared_task
 from .models import Job, JobDLQ, JobLog
 from django.utils import timezone
-from .handlers import handle_email, handle_pdf, handle_image, handle_export
+from .handlers import handle_dlq_test, handle_email, handle_pdf, handle_image, handle_export
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
@@ -48,6 +48,7 @@ def execute_job(self, job_id):
             'pdf_generate': handle_pdf,
             'image_resize': handle_image,
             'data_export': handle_export,
+            'dlq_test': handle_dlq_test,
         }
         job = Job.objects.get(id=job_id)
         send_status(job_id, job.status)
