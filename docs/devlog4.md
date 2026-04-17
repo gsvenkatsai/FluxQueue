@@ -446,7 +446,216 @@ print('Failure reason:', dlq.failure_reason)
 | Third failure  | Marked `DEAD`, written to `JobDLQ` with failure reason + error trace |
 | DLQ requeue    | POST /api/jobs/dlq/:id/requeue/ — resets retry_count, requeues job   |
 
+````
+# DevLog — Layer 4 S5: Timeout Demo
+**Date:** 2026-04-17
+**Layer:** 4 — Failure Simulation
+**Step:** S5 — Timeout Demo
+
+---
+
+## Objective
+
+Submit a job with `timeout_seconds=5` that runs a 30s handler. Verify it gets killed at 5s and marked `FAILED` with `error_msg=timeout`. Show this in the dashboard and DB.
+
+---
+
+## How It Works
+
+Celery's soft time limit mechanism:
+
+1. `soft_time_limit=N` passed to `apply_async`
+2. After N seconds, Celery sends `SIGALRM` to the **forked child process** running the task
+3. Python's signal handler converts `SIGALRM` → raises `SoftTimeLimitExceeded` inside the running handler
+4. `except SoftTimeLimitExceeded` block catches it → sets `status=FAILED`, `error_msg=timeout`
+
+**Critical requirement:** `SIGALRM` only works with the `prefork` pool. `solo` and `threads` pools share process/signal space — the signal either never fires or gets silently dropped.
+
+---
+
+## Implementation
+
+### `views.py` — passing soft_time_limit via apply_async
+
+```python
+# JobView.post
+execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+
+# JobRequeueView.post
+execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+````
+
+`job.id` must be cast to `str` — UUID objects are not JSON serializable by Celery's default serializer.
+
+---
+
+### `tasks.py` — catching SoftTimeLimitExceeded
+
+```python
+from celery.exceptions import SoftTimeLimitExceeded
+
+@shared_task(bind=True)
+def execute_job(self, job_id):
+    ...
+    try:
+        handler = handlers.get(job.job_type)
+        result = handler(job)
+        job.status = 'COMPLETED'
+        ...
+
+    except SoftTimeLimitExceeded:
+        job.status = 'FAILED'
+        job.error_msg = 'timeout'
+        job.save()
+        send_status(job_id, 'FAILED')
+        JobLog.objects.create(job=job, level='ERROR', message='Job timed out')
+
+    except Exception as exc:
+        # retry logic / DLQ
+        ...
 ```
 
-📊 ~87% context remaining
+`SoftTimeLimitExceeded` must be caught **before** the generic `Exception` block. If order is wrong, timeout falls into retry logic → retries 3 times → lands in DLQ instead of `FAILED`.
+
+---
+
+### `handlers.py` — interruptible sleep
+
+```python
+def handle_pdf(job):
+    may_be_choas()
+    for _ in range(30):
+        time.sleep(1)  # 1s increments — SIGALRM can interrupt between iterations
+    return {"status": "pdf generated " + job.payload.get("doc")}
+```
+
+`time.sleep(30)` as a single call can block signal delivery on some OS configurations — the signal fires but the process stays stuck in the syscall until sleep returns. Breaking into 1s increments ensures the signal is handled promptly.
+
+---
+
+## Bugs Hit
+
+### Bug 1 — Idempotency key reuse returning old DEAD job
+
+First test submitted a job that ended up `DEAD` (timeout falling into retry/DLQ due to Bug 2 below). Second test reused the same idempotency key.
+
+Idempotency check:
+
+```python
+if old_job is not None and old_job.status != 'FAILED':
+    return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
+```
+
+`DEAD` is not `FAILED` — so the check passed and returned the old `DEAD` job. Looked like timeout wasn't working.
+
+**Fix:** Use a fresh UUID per test run.
+
+---
+
+### Bug 2 — time.sleep(30) blocking SIGALRM
+
+`SIGALRM` fired at 5s (visible in worker logs), but `SoftTimeLimitExceeded` was never raised inside the handler. The process was stuck in the `sleep(30)` syscall.
+
+**Fix:** Broke sleep into 1s iterations (see handlers.py above).
+
+---
+
+### Bug 3 — Celery logging `succeeded` after timeout
+
+Worker logs showed:
+
+```
+Soft time limit (5s) exceeded for execute_job[...]
+Task execute_job[...] succeeded in 5.05s: None
+```
+
+This is **not a bug**. `succeeded` means the task function returned `None` without an unhandled exception — which is correct. The `except SoftTimeLimitExceeded` block handled the exception and returned cleanly. Job status in DB is the source of truth, not Celery's task-level log.
+
+---
+
+## Test
+
+### Request (Postman)
+
+```
+POST /api/jobs/
+Content-Type: application/json
+
+{
+    "job_type": "pdf_generate",
+    "timeout_seconds": 5,
+    "payload": {"doc": "test.pdf"},
+    "idempotency_key": "c9d8e7f6-b5a4-3210-fedc-ba9876543210"
+}
+```
+
+### Worker Output
+
+```
+[2026-04-17 10:05:55,857: INFO/MainProcess] Task jobs.tasks.execute_job[01c56893-edf7-4985-b0f0-103b33683e1a] received
+[2026-04-17 10:06:00,858: WARNING/MainProcess] Soft time limit (5s) exceeded for jobs.tasks.execute_job[01c56893-edf7-4985-b0f0-103b33683e1a]
+[2026-04-17 10:06:00,895: INFO/ForkPoolWorker-8] Task jobs.tasks.execute_job[01c56893-edf7-4985-b0f0-103b33683e1a] succeeded in 5.05s: None
+```
+
+### API Response
+
+```json
+{
+  "id": "01c56893-edf7-4985-b0f0-103b33683e1a",
+  "job_type": "pdf_generate",
+  "status": "FAILED",
+  "error_msg": "timeout",
+  "retry_count": 0,
+  "timeout_seconds": 5,
+  "logs": [
+    {
+      "level": "INFO",
+      "message": "Job Started",
+      "created_at": "2026-04-17T10:05:55.865685Z"
+    },
+    {
+      "level": "INFO",
+      "message": "Job Running",
+      "created_at": "2026-04-17T10:05:55.871162Z"
+    },
+    {
+      "level": "ERROR",
+      "message": "Job timed out",
+      "created_at": "2026-04-17T10:06:00.858989Z"
+    }
+  ]
+}
+```
+
+---
+
+## Verified
+
+| Check          | Result                                  |
+| -------------- | --------------------------------------- |
+| `status`       | `FAILED` ✅                             |
+| `error_msg`    | `timeout` ✅                            |
+| `retry_count`  | `0` — timeout does not trigger retry ✅ |
+| Elapsed time   | ~5s ✅                                  |
+| JobLog         | `ERROR: Job timed out` ✅               |
+| WebSocket push | `FAILED` status sent ✅                 |
+
+---
+
+## Key Design Decision
+
+Timeout is treated as **terminal failure**, not retryable. Retrying a timed-out job without fixing the root cause (slow handler, downstream latency) will just time out again — burning retries pointlessly. If timeout persists across manual requeues from DLQ, that signals a systemic issue requiring handler-level fix, not automatic retry.
+
+---
+
+## Git Commit Message
+
+```
+feat(jobs): implement soft timeout with SoftTimeLimitExceeded handling
+
+- Pass soft_time_limit=job.timeout_seconds via apply_async in JobView and JobRequeueView
+- Catch SoftTimeLimitExceeded before generic Exception in execute_job
+- On timeout: set status=FAILED, error_msg=timeout, create ERROR joblog, push WS update
+- Fix handle_pdf to use 1s sleep iterations for reliable signal interruption
+- Timeout is terminal — does not trigger retry or DLQ
 ```

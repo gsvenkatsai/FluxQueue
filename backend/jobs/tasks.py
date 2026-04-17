@@ -60,6 +60,7 @@ def execute_job(self, job_id):
         send_log(job_id, joblog)
         joblog = JobLog.objects.create(job=job, message='Job Running', level='INFO')
         send_log(job_id, joblog)
+
         try:
             handler = handlers.get(job.job_type)
             result = handler(job)
@@ -70,6 +71,13 @@ def execute_job(self, job_id):
             send_status(job_id, job.status)
             joblog = JobLog.objects.create(job=job, message='Job Finished', level='INFO')
             send_log(job_id, joblog)
+
+        except SoftTimeLimitExceeded:
+            job.status = 'FAILED'
+            job.error_msg = 'timeout'
+            job.save()
+            send_status(job_id, 'FAILED')
+            JobLog.objects.create(job=job, level='ERROR', message='Job timed out')
 
         except Exception as exc:
             job.retry_count += 1
@@ -96,12 +104,7 @@ def execute_job(self, job_id):
             send_log(job_id, joblog)
             redis_client.delete(lock_key)
             raise self.retry(countdown=wait, max_retries=3, exc=exc)
-    except SoftTimeLimitExceeded:
-        job = Job.objects.get(id=job_id) 
-        job.status = 'FAILED'
-        job.error_msg = 'timeout'
-        job.save()
-        JobLog.objects.create(job=job, level='ERROR', message='Job timed out')    
+
     finally:
         redis_client.delete(lock_key)
 

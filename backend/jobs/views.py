@@ -24,7 +24,7 @@ class JobView(ListCreateAPIView):
         if serializer.is_valid():
             job = serializer.save()
             try:
-                execute_job.apply_async((job.id,), soft_time_limit=job.timeout_seconds)
+                execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
             except (OperationalError, RuntimeError):
                 job.delete()
                 return Response(
