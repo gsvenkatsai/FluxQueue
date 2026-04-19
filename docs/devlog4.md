@@ -1,12 +1,10 @@
 # FluxQueue — Failure Scenarios Devlog
 
----
-
 ## Layer 4 — Failure Simulation
 
 ---
 
-## S1: Chaos Mode (Random Fault Injection)
+# S1: Chaos Mode (Random Fault Injection)
 
 ### What it is
 
@@ -119,7 +117,7 @@ celery -A fluxqueue worker --loglevel=info
 
 ---
 
-## S2: Kill Worker Mid-Job (Zombie Detection)
+# S2: Kill Worker Mid-Job (Zombie Detection)
 
 ### What it is
 
@@ -219,8 +217,7 @@ python manage.py shell -c "from jobs.models import Job; j = Job.objects.filter(j
 | Worker restarted          | Job requeued and completes normally                                      |
 | Timeout exceeded          | Job marked `FAILED` with `error_msg=timeout` via `SoftTimeLimitExceeded` |
 
-````markdown
-## S3: Redis Down Simulation
+# S3: Redis Down Simulation
 
 ### What it is
 
@@ -258,9 +255,6 @@ except (OperationalError, RuntimeError):
         status=status.HTTP_503_SERVICE_UNAVAILABLE
     )
 ```
-````
-
----
 
 ### Observed Output
 
@@ -331,11 +325,9 @@ scanning `PENDING` jobs older than N minutes and requeuing them. Not implemented
 
 ```
 
-📊 ~87% context remaining
 ```
 
-````markdown
-## S4: Force DLQ Demo
+# S4: Force DLQ Demo
 
 ### What it is
 
@@ -364,7 +356,6 @@ live — 3 retries with exponential backoff, job lands in DLQ, manually requeued
 def handle_dlq_test(job):
     raise Exception("Forced failure for DLQ demo")
 ```
-````
 
 **`jobs/tasks.py` — retry + DLQ logic**
 
@@ -446,13 +437,7 @@ print('Failure reason:', dlq.failure_reason)
 | Third failure  | Marked `DEAD`, written to `JobDLQ` with failure reason + error trace |
 | DLQ requeue    | POST /api/jobs/dlq/:id/requeue/ — resets retry_count, requeues job   |
 
-````
-# DevLog — Layer 4 S5: Timeout Demo
-**Date:** 2026-04-17
-**Layer:** 4 — Failure Simulation
-**Step:** S5 — Timeout Demo
-
----
+# S5 — Timeout Demo
 
 ## Objective
 
@@ -483,7 +468,7 @@ execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
 
 # JobRequeueView.post
 execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
-````
+```
 
 `job.id` must be cast to `str` — UUID objects are not JSON serializable by Celery's default serializer.
 
@@ -627,8 +612,6 @@ Content-Type: application/json
 }
 ```
 
----
-
 ## Verified
 
 | Check          | Result                                  |
@@ -659,3 +642,52 @@ feat(jobs): implement soft timeout with SoftTimeLimitExceeded handling
 - Fix handle_pdf to use 1s sleep iterations for reliable signal interruption
 - Timeout is terminal — does not trigger retry or DLQ
 ```
+
+# S6: Duplicate Job Demo
+
+**Date:** 2026-04-16
+**Layer:** 4 — Failure Simulation
+**Step:** S6 — Duplicate Job Demo
+
+---
+
+## Objective
+
+Prove idempotency works end-to-end: submitting the same job twice with the same `idempotency_key` must return the existing job — not create a new one.
+
+---
+
+## What Was Tested
+
+1. Submitted a `dlq_test` job → received `201 Created` with a new job ID and a generated `idempotency_key`.
+2. Resubmitted the exact same request with the same `idempotency_key`.
+3. Received `200 OK` with the **same job ID** — no new job created.
+
+---
+
+## Result
+
+| Attempt          | Status Code | Job ID         | New Job Created? |
+| ---------------- | ----------- | -------------- | ---------------- |
+| First submit     | 201         | `4a0be6d1-...` | Yes              |
+| Duplicate submit | 200         | `4a0be6d1-...` | No               |
+
+---
+
+## Internal Behavior
+
+- On submit, the endpoint checks if a job with the given `idempotency_key` already exists in PostgreSQL.
+- If found → return existing job with `200 OK`. No DB write. No Celery task dispatched.
+- If not found → create new job, save as `PENDING`, push to Redis via Celery `.delay()`, return `201 Created`.
+
+---
+
+## Why This Matters
+
+Without idempotency, a client retry (network timeout, double-click, retry loop) would create duplicate jobs — meaning two emails sent, two payments charged, two rows inserted. The `idempotency_key` is client-generated (UUID), so the client controls deduplication across retries.
+
+---
+
+## Status
+
+✅ S6 complete. Idempotency verified via Postman. Duplicate suppressed at API layer before any queue interaction.
