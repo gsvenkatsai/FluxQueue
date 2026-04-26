@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+from datetime import timedelta
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -162,13 +163,17 @@ CACHES = {
     }
 }   
 
-from celery.schedules import crontab
-
+import os
+CHAOS_MODE = os.environ.get('CHAOS_MODE', 'False') == 'True'
+# settings.py — beat schedule
 CELERY_BEAT_SCHEDULE = {
+    'snapshot-queue-depth': {
+        'task': 'jobs.tasks.snapshot_queue_depth',
+        'schedule': timedelta(seconds=30),  # every 30 seconds — what import do you need?
+    },
+    # keep your existing zombie detection entry
     'detect-zombie-jobs': {
         'task': 'jobs.tasks.detect_zombie_jobs',
         'schedule': 300,  # every 5 minutes
     },
 }
-import os
-CHAOS_MODE = os.environ.get('CHAOS_MODE', 'False') == 'True'

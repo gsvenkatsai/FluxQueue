@@ -2,7 +2,7 @@ import random
 import traceback
 
 from celery import shared_task
-from .models import Job, JobDLQ, JobLog
+from .models import Job, JobDLQ, JobLog, QueueMetric
 from django.utils import timezone
 from .handlers import handle_dlq_test, handle_email, handle_pdf, handle_image, handle_export
 from channels.layers import get_channel_layer
@@ -115,8 +115,10 @@ def worker_heartbeat():
         'worker': current_task.request.hostname,
         'status': 'ACTIVE',
     })  
-
-
+@shared_task
+def snapshot_queue_depth():
+    depth = Job.objects.filter(status='PENDING').count()
+    QueueMetric.objects.create(depth=depth)
 @shared_task
 def detect_zombie_jobs():
     running_jobs = Job.objects.filter(status='RUNNING')

@@ -44,3 +44,9 @@ class JobDLQ(models.Model):
     failure_reason = models.TextField(null=True, blank=True)
     error_trace = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+class QueueMetric(models.Model):
+    timestamp = models.DateTimeField(auto_now_add=True)
+    depth = models.IntegerField(default=0)
+    class Meta:
+        ordering = ['-timestamp']

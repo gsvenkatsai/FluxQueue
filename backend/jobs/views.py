@@ -4,7 +4,7 @@ from rest_framework.generics import ListCreateAPIView, RetrieveAPIView, ListAPIV
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Job, JobDLQ
+from .models import Job, JobDLQ, QueueMetric
 from .serializers import JobDLQSerializer, JobSerializer, JobListSerializer, JobDetailSerializer
 from .tasks import execute_job
 from celery.exceptions import OperationalError
@@ -85,9 +85,14 @@ class StatsView(APIView):
         )['avg_ms']
         # Queue depth = jobs in what status?
         queue_depth = Job.objects.filter(status='PENDING').count()
-        
+        snapshots = QueueMetric.objects.order_by('timestamp')[:60]
+        snapshot_data = [
+            {"timestamp": s.timestamp, "depth": s.depth}
+            for s in snapshots
+        ]
         return Response({
             **status_counts,
+            "queue_depth_history": snapshot_data,
             "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
             "queue_depth": queue_depth,
             "active_workers": active_workers,
