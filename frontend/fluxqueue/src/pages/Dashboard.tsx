@@ -15,6 +15,7 @@ interface Stats {
   failed_count: number;
   dead_count: number;
   workers: Worker[];
+  failure_rate: number;
 }
 interface Worker {
   hostname: string;
@@ -118,6 +119,7 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
+          Failure Rate: {stats.failure_rate.toFixed(1)}%
           <table>
             <thead>
               <tr>

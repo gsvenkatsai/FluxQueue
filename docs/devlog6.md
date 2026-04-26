@@ -99,12 +99,6 @@ Queue depth = jobs waiting to be picked up. `RUNNING` jobs are already being pro
 
 ---
 
-## Status
-
-✅ S1 complete. All 9 metrics returning correctly from a single endpoint.
-
-# FluxQueue — Layer 6 Devlog
-
 ## S2: Queue Depth Snapshots
 
 **Date:** 2026-04-26
@@ -212,12 +206,6 @@ Applying jobs.0005_queuemetric... OK
 ```
 
 ---
-
-## Status
-
-✅ S2 complete. Snapshots firing every 30s via Celery beat. Last 60 returned from `/api/stats/` in chronological order.
-
-# FluxQueue — Layer 6 Devlog
 
 ## S3: Job State Breakdown — Live Pie Chart
 
@@ -454,11 +442,7 @@ wait
 
 ---
 
-## Status
-
-✅ S3 complete. Live pie chart updates instantly on every job status change via WebSocket.
-
-# Devlog — FluxQueue
+## S4 : Worker Health Panel
 
 **Date:** 2026-04-26
 **Layer:** 6 — Observability
@@ -763,6 +747,181 @@ Panel updates live via WebSocket on every job state change (since `send_stats_up
 
 ---
 
+## S5 : Failure Rate Metric
+
+**Date:** 2026-04-26
+**Layer:** 6 — Observability
+**Step:** S5 — Failure Rate Metric
+**Objective:** Calculate and expose failure rate (% of jobs that failed or died) in `/api/stats/`, WebSocket push, and Dashboard UI.
+
+---
+
+## What Changed
+
+### 1. `backend/jobs/views.py`
+
+#### Added `failure_rate` calculation to `StatsView.get()`
+
+```python
+status_counts = Job.objects.aggregate(
+    total_jobs=Count('id'),
+    pending_count=Count('id', filter=Q(status='PENDING')),
+    running_count=Count('id', filter=Q(status='RUNNING')),
+    completed_count=Count('id', filter=Q(status='COMPLETED')),
+    failed_count=Count('id', filter=Q(status='FAILED')),
+    dead_count=Count('id', filter=Q(status='DEAD')),
+)
+
+failure_rate = (
+    (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
+    if status_counts['total_jobs'] > 0 else 0
+)
+
+return Response({
+    **status_counts,
+    "failure_rate": failure_rate,
+    "workers": workers_health,
+    "queue_depth_history": snapshot_data,
+    "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
+    "queue_depth": queue_depth,
+    "active_workers": active_workers,
+    "jobs_per_minute": jobs_per_minute,
+})
+```
+
+**Why each decision:**
+
+- Formula: `(failed_count + dead_count) / total_jobs * 100` — DEAD jobs are terminal failures that exhausted all retries and landed in DLQ. They count as failures for the rate metric.
+- No second DB query — `status_counts` already has all needed fields from the existing aggregate call. Adding a separate `Job.objects.aggregate(...)` for failure rate would be a redundant DB hit.
+- `if status_counts['total_jobs'] > 0 else 0` — guard against division by zero when the jobs table is empty. Without this, the view crashes on a fresh system.
+- `status_counts` is a dict (aggregate returns dict) — access with `status_counts['key']`, not `status_counts.key`.
+
+---
+
+### 2. `backend/jobs/tasks.py`
+
+#### Updated `send_stats_update()` to include `failure_rate`
+
+```python
+def send_stats_update():
+    import json
+    redis_client = get_redis_connection("default")
+    raw = redis_client.get("worker_health")
+    workers_health = json.loads(raw) if raw else []
+
+    status_counts = Job.objects.aggregate(
+        pending_count=Count('id', filter=Q(status='PENDING')),
+        running_count=Count('id', filter=Q(status='RUNNING')),
+        completed_count=Count('id', filter=Q(status='COMPLETED')),
+        failed_count=Count('id', filter=Q(status='FAILED')),
+        dead_count=Count('id', filter=Q(status='DEAD')),
+        total_jobs=Count('id'),
+    )
+
+    failure_rate = (
+        (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
+        if status_counts['total_jobs'] > 0 else 0
+    )
+
+    send_ws('status', {
+        'type': 'stats_update',
+        'data': {
+            **status_counts,
+            'failure_rate': failure_rate,
+            'workers': workers_health
+        }
+    })
+```
+
+**Why:** Every job state change triggers `send_stats_update()`. Including `failure_rate` in the WS push means the dashboard updates live — no polling needed. The calculation is identical to the view so the frontend always sees consistent data whether it came from initial fetch or WebSocket.
+
+---
+
+### 3. `frontend/fluxqueue/src/Dashboard.tsx`
+
+#### Added `failure_rate` to `Stats` interface
+
+```typescript
+interface Stats {
+  pending_count: number;
+  running_count: number;
+  completed_count: number;
+  failed_count: number;
+  dead_count: number;
+  failure_rate: number;
+  workers: Worker[];
+}
+```
+
+#### Displayed failure rate in UI
+
+```tsx
+<p>Failure Rate: {stats.failure_rate.toFixed(1)}%</p>
+```
+
+**Why `toFixed(1)`:** Raw float like `17.094736...` is not user-readable. One decimal place gives enough precision without clutter.
+
+**Why inside `{stats ? (...) : <p>Loading</p>}`:** `stats` is `Stats | null` — accessing `stats.failure_rate` outside the truthy block causes a TypeScript error.
+
+---
+
+## Bugs Hit
+
+### Bug 1: `failure_rate` calculated before `status_counts` defined
+
+**What happened:** First draft put the `failure_rate` calculation above the `status_counts = Job.objects.aggregate(...)` call in `send_stats_update()`. Python raises a `NameError: name 'status_counts' is not defined`.
+
+**Fix:** Moved aggregate call above the `failure_rate` calculation. Order matters — compute data first, derive from it second.
+
+---
+
+### Bug 2: Second redundant DB query
+
+**What happened:** First attempt wrote a separate `failure_cal = Job.objects.aggregate(total_jobs=..., failed_count=..., dead_count=...)` instead of reusing `status_counts`.
+
+**Fix:** Removed the second query. `status_counts` already contains all three fields needed. One DB round-trip is always better than two.
+
+---
+
+### Bug 3: Dict accessed as object attribute
+
+**What happened:** Wrote `failure_cal.failed_count` — Python dicts don't support attribute access. Raises `AttributeError`.
+
+**Fix:** `status_counts['failed_count']` — correct dict key access.
+
+---
+
+### Bug 4: No division-by-zero guard
+
+**What happened:** On a fresh system with no jobs, `status_counts['total_jobs']` is `0`. `x / 0` raises `ZeroDivisionError`.
+
+**Fix:** Added `if status_counts['total_jobs'] > 0 else 0` ternary guard.
+
+---
+
+## Verified Output
+
+### `/api/stats/` response:
+
+```json
+{
+  "failure_rate": 17.0,
+  "failed_count": 5,
+  "dead_count": 36,
+  "total_jobs": 241
+}
+```
+
+### Dashboard UI:
+
+```
+Failure Rate: 17.0%
+```
+
+Updates live via WebSocket on every job state change.
+
+---
+
 ## Status
 
-S4 complete — worker health panel live, data written to Redis by beat task every 30s, served via `/api/stats/` on load and pushed via WebSocket on every job state change.
+S5 complete — failure rate calculated from existing aggregate, exposed in REST API and WebSocket push, displayed in Dashboard with 1 decimal precision.

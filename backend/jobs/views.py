@@ -95,8 +95,13 @@ class StatsView(APIView):
             {"timestamp": s.timestamp, "depth": s.depth}
             for s in snapshots
         ]
+        failure_rate = (
+            (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
+            if status_counts['total_jobs'] > 0 else 0
+        )
         return Response({
             **status_counts,
+            "failure_rate":failure_rate,
             "workers": workers_health,
             "queue_depth_history": snapshot_data,
             "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,

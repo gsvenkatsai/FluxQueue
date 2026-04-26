@@ -38,12 +38,16 @@ def send_stats_update():
     redis_client = get_redis_connection("default")
     raw = redis_client.get("worker_health")
     workers_health = json.loads(raw) if raw else []
-
     status_counts = Job.objects.aggregate(...)
+    failure_rate = (
+        (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
+        if status_counts['total_jobs'] > 0 else 0
+    )
     send_ws('status', {
         'type': 'stats_update',
         'data': {
             **status_counts,
+            'failure_rate':failure_rate,
             'workers': workers_health
         }
     })
