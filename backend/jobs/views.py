@@ -58,13 +58,38 @@ class JobRequeueView(APIView):
         except JobDLQ.DoesNotExist :
             return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)
 
+from django.db.models import Q, Count, Avg, F
+
 class StatsView(APIView):
     def get(self, request):
         now = timezone.now()
+        
+        # Existing
         jobs_per_minute = Job.objects.filter(completed_at__gte=now - timedelta(seconds=60)).count()
         workers = celery_app.control.inspect().ping()
         active_workers = len(workers) if workers else 0
+        
+        # Job counts — fill in the ORM call
+        status_counts = Job.objects.aggregate(
+            total_jobs=Count('id'),
+            pending_count=Count('id', filter=Q(status='PENDING')),
+            running_count=Count('id', filter=Q(status='RUNNING')),
+            completed_count=Count('id', filter=Q(status='COMPLETED')),
+            failed_count=Count('id', filter=Q(status='FAILED')),
+            dead_count=Count('id', filter=Q(status='DEAD')),
+        )
+        
+        # Avg execution time in ms for COMPLETED jobs — what two fields do you subtract?
+        avg_exec = Job.objects.filter(status='COMPLETED').aggregate(
+            avg_ms=Avg(F('completed_at') - F('started_at'))  # hint: F() expressions
+        )['avg_ms']
+        # Queue depth = jobs in what status?
+        queue_depth = Job.objects.filter(status='PENDING').count()
+        
         return Response({
+            **status_counts,
+            "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
+            "queue_depth": queue_depth,
             "active_workers": active_workers,
-            "jobs_per_minute": jobs_per_minute
+            "jobs_per_minute": jobs_per_minute,
         })
