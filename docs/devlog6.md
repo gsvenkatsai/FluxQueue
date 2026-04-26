@@ -102,3 +102,117 @@ Queue depth = jobs waiting to be picked up. `RUNNING` jobs are already being pro
 ## Status
 
 ✅ S1 complete. All 9 metrics returning correctly from a single endpoint.
+
+# FluxQueue — Layer 6 Devlog
+
+## S2: Queue Depth Snapshots
+
+**Date:** 2026-04-26
+**Layer:** 6 — Observability
+**Step:** S2 — Queue depth over time
+
+---
+
+## Objective
+
+Store `queue_depth` snapshots every 30s in a `QueueMetric` table. Return last 60 snapshots from `/api/stats/` for frontend line chart rendering.
+
+---
+
+## What Changed
+
+### `jobs/models.py` — new model
+
+```python
+class QueueMetric(models.Model):
+    timestamp = models.DateTimeField(auto_now_add=True)
+    depth = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['-timestamp']
+```
+
+`auto_now_add=True` — Django sets timestamp automatically on creation. No manual value needed.
+
+### `jobs/tasks.py` — snapshot task
+
+```python
+@shared_task
+def snapshot_queue_depth():
+    depth = Job.objects.filter(status='PENDING').count()
+    QueueMetric.objects.create(depth=depth)
+```
+
+`depth` is an integer from `.count()`. Only field passed to `create()` — timestamp is auto-set.
+
+### `settings.py` — beat schedule
+
+```python
+CELERY_BEAT_SCHEDULE = {
+    'snapshot-queue-depth': {
+        'task': 'jobs.tasks.snapshot_queue_depth',
+        'schedule': 30,
+    },
+    'detect-zombie-jobs': {
+        'task': 'jobs.tasks.detect_zombie_jobs',
+        'schedule': 300,
+    },
+}
+```
+
+### `jobs/views.py` — extend StatsView
+
+```python
+snapshots = QueueMetric.objects.order_by('timestamp')[:60]
+snapshot_data = [
+    {"timestamp": s.timestamp, "depth": s.depth}
+    for s in snapshots
+]
+
+# added to Response
+"queue_depth_history": snapshot_data,
+```
+
+`order_by('timestamp')` ascending — chronological order required for line chart (oldest→newest).
+
+---
+
+## Key Decisions
+
+**Why `auto_now_add` over passing timestamp manually?**
+Snapshot time is always "now" — no reason for the caller to control it. `auto_now_add` enforces this at the DB level.
+
+**Why `[:60]` not `filter(timestamp__gte=now - timedelta(minutes=30))`?**
+Count-based slice is simpler and predictable. Time-based filter could return fewer rows during low-activity periods (e.g. system just started). 60 snapshots at 30s intervals = 30 minutes of history.
+
+**Why ascending order for the query?**
+Frontend renders a line chart left→right = oldest→newest. Descending order would require the frontend to reverse the array.
+
+---
+
+## Verified Output
+
+```json
+"queue_depth_history": [
+    {"timestamp": "2026-04-26T06:24:52.769096Z", "depth": 10},
+    {"timestamp": "2026-04-26T06:24:52.769096Z", "depth": 10},
+    ...
+    {"timestamp": "2026-04-26T06:36:52.747082Z", "depth": 10}
+]
+```
+
+25 snapshots at 30s intervals. Depth flat at 10 — 10 PENDING jobs sitting in queue with no worker running. Expected behavior.
+
+---
+
+## Migration
+
+```
+Applying jobs.0005_queuemetric... OK
+```
+
+---
+
+## Status
+
+✅ S2 complete. Snapshots firing every 30s via Celery beat. Last 60 returned from `/api/stats/` in chronological order.
