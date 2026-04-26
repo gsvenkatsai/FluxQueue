@@ -34,3 +34,17 @@ class WorkerStatusConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps({
             'status': event['status'],
         }))
+
+class StatsConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.group_name = f'status'  # what group name?
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def stats_update(self, event):
+        await self.send(text_data=json.dumps(
+            event['data']
+        ))

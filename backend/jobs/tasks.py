@@ -32,6 +32,21 @@ def send_log(job_id, joblog):
         }
     })
 
+from django.db.models import Count, Q
+
+def send_stats_update():
+    status_counts = Job.objects.aggregate(
+        pending_count=Count('id', filter=Q(status='PENDING')),
+        running_count=Count('id', filter=Q(status='RUNNING')),
+        completed_count=Count('id', filter=Q(status='COMPLETED')),
+        failed_count=Count('id', filter=Q(status='FAILED')),
+        dead_count=Count('id', filter=Q(status='DEAD')),
+    )
+    send_ws('status', {
+        'type': 'stats_update',
+        'data': status_counts
+    })
+
 @shared_task(bind=True)
 def execute_job(self, job_id):
     redis_client = get_redis_connection("default")
@@ -55,6 +70,7 @@ def execute_job(self, job_id):
         job.status = 'RUNNING'
         job.started_at = timezone.now()
         job.save()
+        send_stats_update()
         send_status(job_id, job.status)
         joblog = JobLog.objects.create(job=job, message='Job Started', level='INFO')
         send_log(job_id, joblog)
@@ -68,6 +84,7 @@ def execute_job(self, job_id):
             job.result = result
             job.completed_at = timezone.now()
             job.save()
+            send_stats_update()
             send_status(job_id, job.status)
             joblog = JobLog.objects.create(job=job, message='Job Finished', level='INFO')
             send_log(job_id, joblog)
@@ -76,16 +93,19 @@ def execute_job(self, job_id):
             job.status = 'FAILED'
             job.error_msg = 'timeout'
             job.save()
+            send_stats_update()
             send_status(job_id, 'FAILED')
             JobLog.objects.create(job=job, level='ERROR', message='Job timed out')
 
         except Exception as exc:
             job.retry_count += 1
             job.save()
+            send_stats_update()
 
             if self.request.retries >= 2:
                 job.status = 'DEAD'
                 job.save()
+                send_stats_update()
                 JobDLQ.objects.create(
                     job=job,
                     failure_reason=str(exc),
@@ -99,6 +119,7 @@ def execute_job(self, job_id):
             wait = min(5 * 2**job.retry_count, 3600) + random.uniform(0, 30)
             job.status = 'PENDING'
             job.save()
+            send_stats_update()
             send_status(job_id, job.status)
             joblog = JobLog.objects.create(job=job, message='Job Retrying', level='WARNING')
             send_log(job_id, joblog)

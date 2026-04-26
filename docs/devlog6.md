@@ -216,3 +216,244 @@ Applying jobs.0005_queuemetric... OK
 ## Status
 
 ✅ S2 complete. Snapshots firing every 30s via Celery beat. Last 60 returned from `/api/stats/` in chronological order.
+
+# FluxQueue — Layer 6 Devlog
+
+## S3: Job State Breakdown — Live Pie Chart
+
+**Date:** 2026-04-26
+**Layer:** 6 — Observability
+**Step:** S3 — Job state breakdown
+
+---
+
+## Objective
+
+Show a pie chart of PENDING / RUNNING / COMPLETED / FAILED / DEAD counts that updates via WebSocket when any job changes state — no polling, no page refresh.
+
+---
+
+## What Changed
+
+### `jobs/consumers.py` — new StatsConsumer
+
+```python
+class StatsConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        self.group_name = 'status'
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def stats_update(self, event):
+        await self.send(text_data=json.dumps(event['data']))
+```
+
+Any client connected to `ws/stats/` joins the `status` channel group. When `send_stats_update()` fires in the worker, all connected dashboard clients receive the updated counts instantly.
+
+### `fluxqueue/routing.py` — new route
+
+```python
+path('ws/stats/', StatsConsumer.as_asgi()),
+```
+
+### `jobs/tasks.py` — send_stats_update()
+
+```python
+from django.db.models import Count, Q
+
+def send_stats_update():
+    status_counts = Job.objects.aggregate(
+        pending_count=Count('id', filter=Q(status='PENDING')),
+        running_count=Count('id', filter=Q(status='RUNNING')),
+        completed_count=Count('id', filter=Q(status='COMPLETED')),
+        failed_count=Count('id', filter=Q(status='FAILED')),
+        dead_count=Count('id', filter=Q(status='DEAD')),
+    )
+    send_ws('status', {
+        'type': 'stats_update',
+        'data': status_counts
+    })
+```
+
+Called after every `send_status()` inside `execute_job` — 5 places: RUNNING, COMPLETED, FAILED (timeout), DEAD, PENDING (retry). Every state transition pushes fresh counts to the dashboard.
+
+### `src/pages/Dashboard.tsx` — full code
+
+```tsx
+import { useEffect, useState } from "react";
+
+const COLORS = {
+  PENDING: "#f59e0b",
+  RUNNING: "#3b82f6",
+  COMPLETED: "#22c55e",
+  FAILED: "#ef4444",
+  DEAD: "#6b7280",
+};
+
+interface Stats {
+  pending_count: number;
+  running_count: number;
+  completed_count: number;
+  failed_count: number;
+  dead_count: number;
+}
+
+export default function Dashboard() {
+  const [stats, setStats] = useState<Stats | null>(null);
+
+  // Fetch initial stats on mount — populates chart before WS connects
+  useEffect(() => {
+    fetch("http://localhost:8000/api/stats/")
+      .then((r) => r.json())
+      .then((data) => setStats(data));
+  }, []);
+
+  // WebSocket with auto-reconnect — reconnects every 3s on close
+  useEffect(() => {
+    let ws: WebSocket;
+
+    const connect = () => {
+      ws = new WebSocket("ws://localhost:8000/ws/stats/");
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        // Merge incoming counts into existing stats
+        setStats((prev) => ({ ...prev, ...data }));
+      };
+      ws.onclose = () => setTimeout(connect, 3000);
+    };
+
+    connect();
+    return () => ws.close();
+  }, []);
+
+  // Filter out zero-value slices — SVG arcs break on zero
+  const chartData = stats
+    ? [
+        { name: "PENDING", value: stats.pending_count },
+        { name: "RUNNING", value: stats.running_count },
+        { name: "COMPLETED", value: stats.completed_count },
+        { name: "FAILED", value: stats.failed_count },
+        { name: "DEAD", value: stats.dead_count },
+      ].filter((d) => d.value > 0)
+    : [];
+
+  const total = chartData.reduce((sum, d) => sum + d.value, 0);
+
+  return (
+    <div style={{ padding: "2rem" }}>
+      <h1>Dashboard</h1>
+      {stats ? (
+        <div style={{ display: "flex", alignItems: "center", gap: "2rem" }}>
+          {/* SVG pie chart — manually computed arc paths */}
+          <svg width={300} height={300} viewBox="0 0 300 300">
+            {(() => {
+              let angle = -90; // start from top
+              return chartData.map((d) => {
+                const slice = (d.value / total) * 360;
+                const start = (angle * Math.PI) / 180;
+                const end = ((angle + slice) * Math.PI) / 180;
+                const x1 = 150 + 120 * Math.cos(start);
+                const y1 = 150 + 120 * Math.sin(start);
+                const x2 = 150 + 120 * Math.cos(end);
+                const y2 = 150 + 120 * Math.sin(end);
+                const large = slice > 180 ? 1 : 0;
+                const path = `M150,150 L${x1},${y1} A120,120 0 ${large},1 ${x2},${y2} Z`;
+                angle += slice;
+                return (
+                  <path
+                    key={d.name}
+                    d={path}
+                    fill={COLORS[d.name as keyof typeof COLORS]}
+                  />
+                );
+              });
+            })()}
+          </svg>
+
+          {/* Legend with live counts */}
+          <div>
+            {chartData.map((d) => (
+              <div
+                key={d.name}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  marginBottom: "8px",
+                }}
+              >
+                <div
+                  style={{
+                    width: 12,
+                    height: 12,
+                    borderRadius: "50%",
+                    background: COLORS[d.name as keyof typeof COLORS],
+                  }}
+                />
+                <span>
+                  {d.name}: {d.value}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p>Loading...</p>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## Bugs Hit
+
+### Bug 1 — recharts crashes on React 19
+
+`recharts` (latest + 2.12.7) throws `Cannot read properties of null (reading 'useContext')` on React 19. Known incompatibility.
+
+**Fix:** Replaced with a custom SVG pie chart. Arc paths computed manually:
+
+- Each slice angle = `(value / total) * 360`
+- Start/end coordinates via `Math.cos` / `Math.sin`
+- SVG path: `M cx,cy L x1,y1 A r,r 0 large,1 x2,y2 Z`
+
+### Bug 2 — WebSocket fails in browser, works via curl
+
+Browser: "WebSocket is closed before connection is established"
+curl: `HTTP/1.1 101 Switching Protocols` ✅
+
+**Root cause:** React StrictMode mounts twice in dev — first mount opens WS, cleanup closes it before handshake completes.
+
+**Fix:** Removed `<React.StrictMode>` in `main.tsx`.
+
+### Bug 3 — Zero-value slices cause degenerate arc paths
+
+`running_count: 0` → slice = 0° → start and end points identical → invalid SVG path.
+
+**Fix:** `.filter((d) => d.value > 0)` before rendering.
+
+---
+
+## Verified
+
+Submitted 10 jobs via bash script. RUNNING slice appeared and disappeared live without page refresh. WebSocket push confirmed end-to-end.
+
+```bash
+for i in $(seq 1 20); do
+  curl -s -X POST http://localhost:8000/api/jobs/ \
+    -H "Content-Type: application/json" \
+    -d "{\"job_type\": \"image_resize\", \"payload\": {\"file\": \"test.jpg\"}, \"timeout_seconds\": 30, \"idempotency_key\": \"$(python3 -c "import uuid; print(uuid.uuid4())")\"}" &
+done
+wait
+```
+
+---
+
+## Status
+
+✅ S3 complete. Live pie chart updates instantly on every job status change via WebSocket.

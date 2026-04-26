@@ -26,7 +26,7 @@ exec bash"
 # exec bash"
 
 # 5. React frontend
-# gnome-terminal -- bash -c "
-# cd ~/fluxqueue/frontend/fluxqueue
-# npm run dev
-# exec bash"
+gnome-terminal -- bash -c "
+cd ~/fluxqueue/frontend/fluxqueue
+npm run dev
+exec bash"
