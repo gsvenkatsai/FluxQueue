@@ -32,7 +32,7 @@ def send_log(job_id, joblog):
         }
     })
 
-from django.db.models import Count, Q
+from django.db.models import F, Avg, Count, Q
 import json
 def send_stats_update():
     redis_client = get_redis_connection("default")
@@ -43,10 +43,23 @@ def send_stats_update():
         (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
         if status_counts['total_jobs'] > 0 else 0
     )
+    avg_exec = Job.objects.filter(status='COMPLETED').aggregate(
+        avg_ms=Avg(F('completed_at') - F('started_at'))  # hint: F() expressions
+    )['avg_ms']
+    avg_exec_ms = round(avg_exec.total_seconds() * 1000, 3) if avg_exec else 0
+    avg_exec_per_type = Job.objects.filter(status='COMPLETED') \
+        .values('job_type') \
+        .annotate(avg_ms=Avg(F('completed_at') - F('started_at')))
+    avg_exec_per_type = {
+        item['job_type']: round(item['avg_ms'].total_seconds() * 1000, 2)
+        for item in avg_exec_per_type
+    }    
     send_ws('status', {
         'type': 'stats_update',
         'data': {
             **status_counts,
+            'avg_exec':avg_exec_ms,
+            'avg_exec_per_type':avg_exec_per_type,
             'failure_rate':failure_rate,
             'workers': workers_health
         }

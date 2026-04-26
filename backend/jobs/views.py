@@ -88,6 +88,13 @@ class StatsView(APIView):
         avg_exec = Job.objects.filter(status='COMPLETED').aggregate(
             avg_ms=Avg(F('completed_at') - F('started_at'))  # hint: F() expressions
         )['avg_ms']
+        avg_exec_per_type = Job.objects.filter(status='COMPLETED') \
+            .values('job_type') \
+            .annotate(avg_ms=Avg(F('completed_at') - F('started_at')))
+        avg_exec_per_type = {
+            item['job_type']: round(item['avg_ms'].total_seconds() * 1000, 2)
+            for item in avg_exec_per_type
+        }
         # Queue depth = jobs in what status?
         queue_depth = Job.objects.filter(status='PENDING').count()
         snapshots = QueueMetric.objects.order_by('timestamp')[:60]
@@ -105,6 +112,7 @@ class StatsView(APIView):
             "workers": workers_health,
             "queue_depth_history": snapshot_data,
             "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
+            "avg_exec_per_type" : avg_exec_per_type if avg_exec_per_type else None,
             "queue_depth": queue_depth,
             "active_workers": active_workers,
             "jobs_per_minute": jobs_per_minute,

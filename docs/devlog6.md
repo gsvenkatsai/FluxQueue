@@ -922,6 +922,186 @@ Updates live via WebSocket on every job state change.
 
 ---
 
-## Status
+## S6 : Avg Execution Time per Job Type
 
-S5 complete — failure rate calculated from existing aggregate, exposed in REST API and WebSocket push, displayed in Dashboard with 1 decimal precision.
+**Date:** 2026-04-26
+**Layer:** 6 — Observability
+**Step:** S6 — Avg Execution Time per Job Type
+**Objective:** Calculate and display average execution time broken down by job_type, exposed via REST API and WebSocket push, rendered as a table in the dashboard.
+
+---
+
+## 1. What Changed
+
+### `backend/jobs/views.py` — Stats API
+
+Added `avg_exec_per_type` to the `/api/stats/` response.
+
+```python
+from django.db.models import Avg, F
+
+# Per job_type avg execution time
+avg_exec_per_type_qs = Job.objects.filter(status='COMPLETED') \
+    .values('job_type') \
+    .annotate(avg_ms=Avg(F('completed_at') - F('started_at')))
+
+# Convert timedelta to milliseconds
+avg_exec_per_type = {
+    item['job_type']: round(item['avg_ms'].total_seconds() * 1000, 2)
+    for item in avg_exec_per_type_qs
+}
+```
+
+- `values('job_type')` — groups the queryset by job_type
+- `annotate(avg_ms=...)` — computes avg per group (not overall)
+- `F('completed_at') - F('started_at')` — returns a `timedelta` per job
+- `Avg(...)` — averages the timedeltas per group
+- `.total_seconds() * 1000` — converts timedelta to milliseconds
+- Added `"avg_exec_per_type": avg_exec_per_type` to the JSON response
+
+---
+
+### `backend/jobs/tasks.py` — `send_stats_update()`
+
+Added `avg_exec_per_type` and fixed `avg_exec` conversion in the WebSocket push payload.
+
+```python
+# Overall avg (already existed, fixed timedelta conversion)
+avg_exec = Job.objects.filter(status='COMPLETED').aggregate(
+    avg_ms=Avg(F('completed_at') - F('started_at'))
+)['avg_ms']
+avg_exec_ms = round(avg_exec.total_seconds() * 1000, 3) if avg_exec else 0
+
+# Per job_type avg
+avg_exec_per_type_qs = Job.objects.filter(status='COMPLETED') \
+    .values('job_type') \
+    .annotate(avg_ms=Avg(F('completed_at') - F('started_at')))
+avg_exec_per_type = {
+    item['job_type']: round(item['avg_ms'].total_seconds() * 1000, 2)
+    for item in avg_exec_per_type_qs
+}
+
+# Push to WebSocket
+send_ws('status', {
+    'type': 'stats_update',
+    'data': {
+        **status_counts,
+        'avg_exec': avg_exec_ms,
+        'avg_exec_per_type': avg_exec_per_type,
+        'failure_rate': failure_rate,
+        'workers': workers_health
+    }
+})
+```
+
+- `avg_exec` was previously sent as raw `timedelta` — fixed to ms float
+- `avg_exec_per_type` now included in every WS push
+
+---
+
+### `frontend/fluxqueue/src/components/AvgExecTable.tsx` — New Component
+
+```tsx
+export default function AvgExecTable({
+  data,
+}: {
+  data: Record<string, number>;
+}) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Job Type</th>
+          <th>Avg Time (ms)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {Object.entries(data ?? {}).map(([type, ms]) => (
+          <tr key={type}>
+            <td>{type}</td>
+            <td>{ms}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+- Accepts `Record<string, number>` — job_type → avg_ms
+- `Object.entries()` used to iterate over the object
+- `?? {}` guard prevents crash if data is undefined on first render
+
+---
+
+### `frontend/fluxqueue/src/pages/Dashboard.tsx` — Refactor + Integration
+
+Extracted 3 components from monolithic Dashboard:
+
+- `JobStatusPieChart` — SVG pie chart + legend
+- `WorkerHealthTable` — worker hostname/status/active jobs
+- `AvgExecTable` — new, avg exec per job type
+
+Updated `Stats` interface:
+
+```typescript
+interface Stats {
+  pending_count: number;
+  running_count: number;
+  completed_count: number;
+  failed_count: number;
+  dead_count: number;
+  workers: { hostname: string; is_online: boolean; active_jobs: number }[];
+  failure_rate: number;
+  avg_exec_per_type: Record<string, number>; // added
+}
+```
+
+Dashboard now composes components:
+
+```tsx
+<JobStatusPieChart {...stats} />
+<span>Failure Rate: {stats.failure_rate.toFixed(1)}%</span>
+<WorkerHealthTable workers={stats.workers} />
+<AvgExecTable data={stats.avg_exec_per_type} />
+```
+
+---
+
+## 2. Bugs Hit
+
+**Bug 1: `avg_ms` returned as `timedelta`, not a number**
+
+- Root cause: Django ORM subtraction of two `DateTimeField`s returns a Python `timedelta` object, not a float
+- Fix: `.total_seconds() * 1000` to convert to milliseconds before serializing
+
+**Bug 2: `avg_exec` in `send_stats_update()` was sending raw timedelta over WebSocket**
+
+- Root cause: Conversion was missing in tasks.py even though views.py had it
+- Fix: Added `avg_exec_ms = round(avg_exec.total_seconds() * 1000, 3) if avg_exec else 0`
+
+---
+
+## 3. Verified Output
+
+`GET /api/stats/` response:
+
+```json
+{
+  "avg_execution_time_ms": 5296.754,
+  "avg_exec_per_type": {
+    "email_send": 6468.65,
+    "image_resize": 3028.36,
+    "pdf_generate": 18448.56,
+    "data_export": 7017.51
+  }
+}
+```
+
+Dashboard renders table with all 4 job types and their avg times. Updates live via WebSocket when new jobs complete.
+
+---
+
+## 4. Status
+
+S6 complete — avg execution time per job_type visible in API response, WebSocket push, and dashboard table.
