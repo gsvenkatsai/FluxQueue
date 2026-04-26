@@ -1,3 +1,5 @@
+from datetime import timedelta
+from django.utils import timezone
 from rest_framework.generics import ListCreateAPIView, RetrieveAPIView, ListAPIView
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -6,6 +8,10 @@ from .models import Job, JobDLQ
 from .serializers import JobDLQSerializer, JobSerializer, JobListSerializer, JobDetailSerializer
 from .tasks import execute_job
 from celery.exceptions import OperationalError
+
+from celery.app import app_or_default
+celery_app = app_or_default()
+
 class JobDetailView(RetrieveAPIView):
     queryset = Job.objects.all()
     serializer_class = JobDetailSerializer
@@ -51,3 +57,14 @@ class JobRequeueView(APIView):
             return Response(JobSerializer(job).data, status=status.HTTP_201_CREATED)
         except JobDLQ.DoesNotExist :
             return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)
+
+class StatsView(APIView):
+    def get(self, request):
+        now = timezone.now()
+        jobs_per_minute = Job.objects.filter(completed_at__gte=now - timedelta(seconds=60)).count()
+        workers = celery_app.control.inspect().ping()
+        active_workers = len(workers) if workers else 0
+        return Response({
+            "active_workers": active_workers,
+            "jobs_per_minute": jobs_per_minute
+        })
