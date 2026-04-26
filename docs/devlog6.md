@@ -457,3 +457,312 @@ wait
 ## Status
 
 ✅ S3 complete. Live pie chart updates instantly on every job status change via WebSocket.
+
+# Devlog — FluxQueue
+
+**Date:** 2026-04-26
+**Layer:** 6 — Observability
+**Step:** S4 — Worker Health Panel
+**Objective:** Show live worker status (hostname, online/offline, active job count) in the Dashboard, updated via WebSocket.
+
+---
+
+## What Changed
+
+### 1. `backend/jobs/tasks.py`
+
+#### Added `get_worker_health` task
+
+```python
+@shared_task
+def get_worker_health():
+    import json
+    redis_client = get_redis_connection("default")
+
+    i = current_app.control.inspect(timeout=1)
+    ping = i.ping() or {}
+    active = i.active() or {}
+
+    workers = []
+    for hostname in ping:
+        workers.append({
+            "hostname": hostname,
+            "is_online": True,
+            "active_jobs": len(active.get(hostname, [])),
+        })
+
+    redis_client.set("worker_health", json.dumps(workers))
+    return workers
+```
+
+**Why each decision:**
+
+- `current_app.control.inspect(timeout=1)` — `timeout=1` is critical. Without it, if a worker is dead, `inspect()` hangs indefinitely waiting for a response. 1 second is enough for a live worker to respond over localhost/Redis.
+- `i.ping() or {}` — `ping()` returns `None` if no workers respond. `or {}` prevents a `TypeError` when iterating.
+- `i.active() or {}` — same reason. `active()` returns active tasks per worker as `{hostname: [task, task, ...]}`.
+- `is_online: True` — if a hostname appears in `ping`, it responded, so it's alive by definition. There's no case where a hostname is in `ping` but offline.
+- `len(active.get(hostname, []))` — `active.get(hostname, [])` returns the list of running tasks for that worker (or empty list if none). `len()` gives the count.
+- `redis_client.set("worker_health", json.dumps(workers))` — worker health is current state only, no history needed. Redis is the right store (not DB). `json.dumps` serializes the Python list to a string for Redis storage.
+- `import json` and `redis_client = get_redis_connection("default")` defined inline — `json` wasn't imported at the top of the file; `get_redis_connection` was already imported globally but `redis_client` wasn't instantiated at module level, so both are defined inside the function.
+
+#### Updated `send_stats_update()`
+
+```python
+def send_stats_update():
+    import json
+    redis_client = get_redis_connection("default")
+    raw = redis_client.get("worker_health")
+    workers_health = json.loads(raw) if raw else []
+
+    status_counts = Job.objects.aggregate(
+        pending_count=Count('id', filter=Q(status='PENDING')),
+        running_count=Count('id', filter=Q(status='RUNNING')),
+        completed_count=Count('id', filter=Q(status='COMPLETED')),
+        failed_count=Count('id', filter=Q(status='FAILED')),
+        dead_count=Count('id', filter=Q(status='DEAD')),
+    )
+    send_ws('status', {
+        'type': 'stats_update',
+        'data': {
+            **status_counts,
+            'workers': workers_health
+        }
+    })
+```
+
+**Why:** Every time a job changes state, `send_stats_update()` fires and pushes to the `StatsConsumer`. Adding `workers` here means the frontend gets worker health in every WebSocket push — no separate channel or consumer needed. Worker data comes from Redis (written by the beat task every 30s). `json.loads(raw) if raw else []` handles the case where the beat task hasn't run yet (Redis key doesn't exist).
+
+---
+
+### 2. `backend/fluxqueue/settings.py`
+
+#### Added `get_worker_health` to `CELERY_BEAT_SCHEDULE`
+
+```python
+CELERY_BEAT_SCHEDULE = {
+    'snapshot-queue-depth': {
+        'task': 'jobs.tasks.snapshot_queue_depth',
+        'schedule': timedelta(seconds=30),
+    },
+    'detect-zombie-jobs': {
+        'task': 'jobs.tasks.detect_zombie_jobs',
+        'schedule': 300,
+    },
+    'get-worker-health': {
+        'task': 'jobs.tasks.get_worker_health',
+        'schedule': timedelta(seconds=30),
+    }
+}
+```
+
+**Why:** Beat task runs every 30s — same cadence as `snapshot_queue_depth`. This keeps Redis worker data fresh without hammering Celery inspect on every API request.
+
+---
+
+### 3. `backend/jobs/views.py`
+
+#### Updated `StatsView.get()`
+
+Added Redis read for worker health and included it in the response. Also fixed `inspect()` timeout.
+
+```python
+from django_redis import get_redis_connection
+import json
+
+class StatsView(APIView):
+    def get(self, request):
+        now = timezone.now()
+
+        # Read worker health from Redis (written by beat task)
+        redis_client = get_redis_connection("default")
+        raw = redis_client.get("worker_health")
+        workers_health = json.loads(raw) if raw else []
+
+        # Fixed: added timeout=1 to prevent hanging on dead workers
+        workers = celery_app.control.inspect(timeout=1).ping()
+        active_workers = len(workers) if workers else 0
+
+        status_counts = Job.objects.aggregate(
+            total_jobs=Count('id'),
+            pending_count=Count('id', filter=Q(status='PENDING')),
+            running_count=Count('id', filter=Q(status='RUNNING')),
+            completed_count=Count('id', filter=Q(status='COMPLETED')),
+            failed_count=Count('id', filter=Q(status='FAILED')),
+            dead_count=Count('id', filter=Q(status='DEAD')),
+        )
+
+        avg_exec = Job.objects.filter(status='COMPLETED').aggregate(
+            avg_ms=Avg(F('completed_at') - F('started_at'))
+        )['avg_ms']
+
+        queue_depth = Job.objects.filter(status='PENDING').count()
+        snapshots = QueueMetric.objects.order_by('timestamp')[:60]
+        snapshot_data = [
+            {"timestamp": s.timestamp, "depth": s.depth}
+            for s in snapshots
+        ]
+
+        return Response({
+            **status_counts,
+            "workers": workers_health,
+            "queue_depth_history": snapshot_data,
+            "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
+            "queue_depth": queue_depth,
+            "active_workers": active_workers,
+            "jobs_per_minute": jobs_per_minute,
+        })
+```
+
+**Why:** `/api/stats/` is the initial load — before the WebSocket connects, the frontend fetches this. Including `workers` here means the panel populates immediately on page load, not just after the first WS push.
+
+**Bug fixed:** Original `inspect().ping()` had no timeout — added `timeout=1` to match the beat task pattern and prevent the view hanging if workers are down.
+
+---
+
+### 4. `frontend/fluxqueue/src/Dashboard.tsx`
+
+#### Added `Worker` interface and merged into `Stats`
+
+```typescript
+interface Worker {
+  hostname: string;
+  is_online: boolean;
+  active_jobs: number;
+}
+
+interface Stats {
+  pending_count: number;
+  running_count: number;
+  completed_count: number;
+  failed_count: number;
+  dead_count: number;
+  workers: Worker[];
+}
+```
+
+**Why:** Previously had two separate `Stats` interface declarations which TypeScript rejects. Merged into one with `workers: Worker[]` added.
+
+#### Added worker health table inside the stats render block
+
+```tsx
+<table>
+  <thead>
+    <tr>
+      <th>Worker</th>
+      <th>Status</th>
+      <th>Active Jobs</th>
+    </tr>
+  </thead>
+  <tbody>
+    {stats.workers?.map((w) => (
+      <tr key={w.hostname}>
+        <td>{w.hostname}</td>
+        <td>{w.is_online ? "🟢 Online" : "🔴 Offline"}</td>
+        <td>{w.active_jobs}</td>
+      </tr>
+    ))}
+  </tbody>
+</table>
+```
+
+**Why placed inside `{stats ? (...) : <p>Loading</p>}`:** `stats` is typed as `Stats | null`. Accessing `stats.workers` outside the truthy block causes a TypeScript error. The table is inside the block so TypeScript knows `stats` is non-null.
+
+**Why `stats.workers?.map` (optional chaining):** On initial API fetch, if the beat task hasn't run yet, `workers` could be `undefined` in the response. Optional chaining prevents a crash.
+
+---
+
+## Bugs Hit
+
+### Bug 1: `shared_task.control.inspect()` — wrong object
+
+**What happened:** Initially wrote `shared_task.control.inspect(timeout=1)`. `shared_task` is a decorator function, not the Celery app instance — it has no `.control` attribute.
+
+**Fix:** Use `current_app.control.inspect(timeout=1)`. `current_app` is the running Celery app instance. Import: `from celery import current_app`.
+
+---
+
+### Bug 2: `redis_client` undefined at module level
+
+**What happened:** `redis_client.set(...)` threw a `NameError` — `redis_client` was used inside `get_worker_health` but never defined in that scope. `get_redis_connection` was imported but not called.
+
+**Fix:** Added `redis_client = get_redis_connection("default")` inside the function body. `json` was also missing — added `import json` inline.
+
+---
+
+### Bug 3: `is_online: ping` and `active_jobs: active`
+
+**What happened:** First attempt set `is_online` to the entire `ping` dict and `active_jobs` to the entire `active` dict instead of the derived values.
+
+**Fix:**
+
+- `is_online: True` — hostname being present in `ping` means it's alive.
+- `active_jobs: len(active.get(hostname, []))` — get the task list for this worker, take its length.
+
+---
+
+### Bug 4: Two `Stats` interface declarations in TypeScript
+
+**What happened:** Added a second `interface Stats` block with `workers` instead of merging into the existing one. TypeScript raises a duplicate identifier error.
+
+**Fix:** Merged into a single interface with all fields including `workers: Worker[]`.
+
+---
+
+### Bug 5: Worker table rendered outside `{stats ? ...}` block
+
+**What happened:** Table was placed after the closing `)}` of the stats conditional block. TypeScript flagged `stats.workers` as potentially null.
+
+**Fix:** Moved the table inside the `{stats ? (...) : <p>Loading...</p>}` block.
+
+---
+
+### Bug 6: `inspect()` no timeout in `StatsView`
+
+**What happened:** `celery_app.control.inspect().ping()` had no timeout. If a worker dies mid-request, this hangs the entire `/api/stats/` response.
+
+**Fix:** Changed to `inspect(timeout=1).ping()`.
+
+---
+
+### Bug 7: `workers: []` on first load
+
+**What happened:** Hit `/api/stats/` immediately after adding the endpoint — got `"workers": []`. Not a bug — the beat task hadn't run yet so the Redis key didn't exist.
+
+**Fix:** Manually triggered: `celery -A fluxqueue call jobs.tasks.get_worker_health`. Subsequent call to `/api/stats/` returned correct worker data.
+
+---
+
+## Verified Output
+
+### `/api/stats/` response (after beat task ran):
+
+```json
+{
+  "workers": [
+    {
+      "hostname": "celery@VenkatSai",
+      "is_online": true,
+      "active_jobs": 1
+    }
+  ],
+  "pending_count": 10,
+  "running_count": 0,
+  "completed_count": 190,
+  "failed_count": 5,
+  "dead_count": 36
+}
+```
+
+### Dashboard UI:
+
+Worker health panel rendered with:
+
+- `celery@VenkatSai` | 🟢 Online | 1
+
+Panel updates live via WebSocket on every job state change (since `send_stats_update()` now includes workers).
+
+---
+
+## Status
+
+S4 complete — worker health panel live, data written to Redis by beat task every 30s, served via `/api/stats/` on load and pushed via WebSocket on every job state change.

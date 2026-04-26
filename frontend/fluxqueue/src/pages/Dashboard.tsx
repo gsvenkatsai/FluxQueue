@@ -14,6 +14,12 @@ interface Stats {
   completed_count: number;
   failed_count: number;
   dead_count: number;
+  workers: Worker[];
+}
+interface Worker {
+  hostname: string;
+  is_online: boolean;
+  active_jobs: number;
 }
 
 export default function Dashboard() {
@@ -112,6 +118,24 @@ export default function Dashboard() {
               </div>
             ))}
           </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Worker</th>
+                <th>Status</th>
+                <th>Active Jobs</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.workers?.map((w) => (
+                <tr key={w.hostname}>
+                  <td>{w.hostname}</td>
+                  <td>{w.is_online ? "🟢 Online" : "🔴 Offline"}</td>
+                  <td>{w.active_jobs}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       ) : (
         <p>Loading...</p>

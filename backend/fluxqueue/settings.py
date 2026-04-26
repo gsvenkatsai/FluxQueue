@@ -176,4 +176,8 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'jobs.tasks.detect_zombie_jobs',
         'schedule': 300,  # every 5 minutes
     },
+    'get-worker-health' : {
+        'task': 'jobs.tasks.get_worker_health',
+        'schedule': timedelta(seconds=30)
+    }
 }

@@ -1,7 +1,7 @@
 import random
 import traceback
 
-from celery import shared_task
+from celery import current_app, shared_task
 from .models import Job, JobDLQ, JobLog, QueueMetric
 from django.utils import timezone
 from .handlers import handle_dlq_test, handle_email, handle_pdf, handle_image, handle_export
@@ -33,18 +33,19 @@ def send_log(job_id, joblog):
     })
 
 from django.db.models import Count, Q
-
+import json
 def send_stats_update():
-    status_counts = Job.objects.aggregate(
-        pending_count=Count('id', filter=Q(status='PENDING')),
-        running_count=Count('id', filter=Q(status='RUNNING')),
-        completed_count=Count('id', filter=Q(status='COMPLETED')),
-        failed_count=Count('id', filter=Q(status='FAILED')),
-        dead_count=Count('id', filter=Q(status='DEAD')),
-    )
+    redis_client = get_redis_connection("default")
+    raw = redis_client.get("worker_health")
+    workers_health = json.loads(raw) if raw else []
+
+    status_counts = Job.objects.aggregate(...)
     send_ws('status', {
         'type': 'stats_update',
-        'data': status_counts
+        'data': {
+            **status_counts,
+            'workers': workers_health
+        }
     })
 
 @shared_task(bind=True)
@@ -153,3 +154,23 @@ def detect_zombie_jobs():
             JobLog.objects.create(job=job, level='WARNING', message='Zombie detected — requeuing')
             send_status(str(job.id), 'PENDING')
             execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+
+
+@shared_task
+def get_worker_health():
+    import json
+    redis_client = get_redis_connection("default")
+    i = current_app.control.inspect(timeout=1)
+    ping = i.ping() or {}
+    active = i.active() or {}
+    
+    workers = []
+    for hostname in ping:
+        workers.append({
+            "hostname": hostname,
+            "is_online": True,
+            "active_jobs": len(active.get(hostname, [])),
+        })
+    
+    redis_client.set("worker_health", json.dumps(workers))
+    return workers

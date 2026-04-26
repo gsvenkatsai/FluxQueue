@@ -59,14 +59,19 @@ class JobRequeueView(APIView):
             return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)
 
 from django.db.models import Q, Count, Avg, F
-
+import json
+from django_redis import get_redis_connection
 class StatsView(APIView):
     def get(self, request):
         now = timezone.now()
-        
+
+        redis_client = get_redis_connection("default")
+        raw = redis_client.get("worker_health")
+        workers_health = json.loads(raw) if raw else []
+
         # Existing
         jobs_per_minute = Job.objects.filter(completed_at__gte=now - timedelta(seconds=60)).count()
-        workers = celery_app.control.inspect().ping()
+        workers = celery_app.control.inspect(timeout=1).ping()
         active_workers = len(workers) if workers else 0
         
         # Job counts — fill in the ORM call
@@ -92,6 +97,7 @@ class StatsView(APIView):
         ]
         return Response({
             **status_counts,
+            "workers": workers_health,
             "queue_depth_history": snapshot_data,
             "avg_execution_time_ms": avg_exec.total_seconds() * 1000 if avg_exec else None,
             "queue_depth": queue_depth,
