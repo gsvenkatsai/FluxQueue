@@ -27,8 +27,8 @@ export default function JobStatusPieChart(props: Props) {
   const total = chartData.reduce((sum, d) => sum + d.value, 0);
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "2rem" }}>
-      <svg width={300} height={300} viewBox="0 0 300 300">
+    <div className="flex items-center gap-6">
+      <svg width={160} height={160} viewBox="0 0 300 300">
         {(() => {
           let angle = -90;
           return chartData.map((d) => {
@@ -47,32 +47,21 @@ export default function JobStatusPieChart(props: Props) {
                 key={d.name}
                 d={path}
                 fill={COLORS[d.name as keyof typeof COLORS]}
+                opacity={0.9}
               />
             );
           });
         })()}
       </svg>
-      <div>
+      <div className="flex flex-col gap-2">
         {chartData.map((d) => (
-          <div
-            key={d.name}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              marginBottom: "8px",
-            }}
-          >
+          <div key={d.name} className="flex items-center gap-2">
             <div
-              style={{
-                width: 12,
-                height: 12,
-                borderRadius: "50%",
-                background: COLORS[d.name as keyof typeof COLORS],
-              }}
+              className="w-3 h-3 rounded-full flex-shrink-0"
+              style={{ background: COLORS[d.name as keyof typeof COLORS] }}
             />
-            <span>
-              {d.name}: {d.value}
+            <span className="text-sm text-gray-300">
+              {d.name}: <span className="text-white font-semibold">{d.value}</span>
             </span>
           </div>
         ))}
