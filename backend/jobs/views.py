@@ -30,7 +30,9 @@ class JobView(ListCreateAPIView):
         if serializer.is_valid():
             job = serializer.save()
             try:
+                print("BEFORE DELAY", job.id)
                 execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+                print("AFTER DELAY")
             except (OperationalError, RuntimeError):
                 job.delete()
                 return Response(
@@ -106,8 +108,24 @@ class StatsView(APIView):
             (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
             if status_counts['total_jobs'] > 0 else 0
         )
+
+        from django.db.models.functions import TruncMinute
+
+        throughput = (
+            Job.objects
+            .filter(completed_at__gte=now - timedelta(hours=1), status='COMPLETED')
+            .annotate(minute=TruncMinute('completed_at'))
+            .values('minute')
+            .annotate(count=Count('id'))
+            .order_by('minute')
+        )
+        throughput_data = [
+            {"minute": item["minute"].isoformat(), "count": item["count"]}
+            for item in throughput
+        ]
         return Response({
             **status_counts,
+            "throughput" : throughput_data,
             "failure_rate":failure_rate,
             "workers": workers_health,
             "queue_depth_history": snapshot_data,

@@ -15,6 +15,8 @@ from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 from django.utils import timezone
 from datetime import timedelta
 
+from django.db.models.functions import TruncMinute
+
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -35,10 +37,18 @@ def send_log(job_id, joblog):
 from django.db.models import F, Avg, Count, Q
 import json
 def send_stats_update():
+    now = timezone.now()
     redis_client = get_redis_connection("default")
     raw = redis_client.get("worker_health")
     workers_health = json.loads(raw) if raw else []
-    status_counts = Job.objects.aggregate(...)
+    status_counts = Job.objects.aggregate(
+        total_jobs=Count('id'),
+        pending_count=Count('id', filter=Q(status='PENDING')),
+        running_count=Count('id', filter=Q(status='RUNNING')),
+        completed_count=Count('id', filter=Q(status='COMPLETED')),
+        failed_count=Count('id', filter=Q(status='FAILED')),
+        dead_count=Count('id', filter=Q(status='DEAD')),
+    )
     failure_rate = (
         (status_counts['failed_count'] + status_counts['dead_count']) / status_counts['total_jobs'] * 100
         if status_counts['total_jobs'] > 0 else 0
@@ -53,11 +63,24 @@ def send_stats_update():
     avg_exec_per_type = {
         item['job_type']: round(item['avg_ms'].total_seconds() * 1000, 2)
         for item in avg_exec_per_type
-    }    
+    }
+    throughput = (
+        Job.objects
+        .filter(completed_at__gte=now - timedelta(hours=1), status='COMPLETED')
+        .annotate(minute=TruncMinute('completed_at'))
+        .values('minute')
+        .annotate(count=Count('id'))
+        .order_by('minute')
+        )
+    throughput_data = [
+        {"minute": item["minute"].isoformat(), "count": item["count"]}
+        for item in throughput
+        ]    
     send_ws('status', {
         'type': 'stats_update',
         'data': {
             **status_counts,
+            'throughput' : throughput_data,
             'avg_exec':avg_exec_ms,
             'avg_exec_per_type':avg_exec_per_type,
             'failure_rate':failure_rate,

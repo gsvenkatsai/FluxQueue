@@ -1105,3 +1105,158 @@ Dashboard renders table with all 4 job types and their avg times. Updates live v
 ## 4. Status
 
 S6 complete — avg execution time per job_type visible in API response, WebSocket push, and dashboard table.
+
+# S7 : Job Throughput Chart
+
+**Date:** 2026-05-02  
+**Layer:** 6 — Observability  
+**Step:** S7 — Job Throughput Chart  
+**Objective:** Line chart showing jobs completed per minute over last 60 minutes, live via WebSocket.
+
+---
+
+## What Changed
+
+### `backend/jobs/views.py` — StatsView
+
+Added `TruncMinute` query to compute per-minute completed job counts over the last hour. Result serialized to list of `{minute, count}` dicts (`.isoformat()` to make datetime JSON-serializable). Added `"throughput"` key to response.
+
+```python
+from django.db.models.functions import TruncMinute
+
+throughput = (
+    Job.objects
+    .filter(completed_at__gte=now - timedelta(hours=1), status='COMPLETED')
+    .annotate(minute=TruncMinute('completed_at'))
+    .values('minute')
+    .annotate(count=Count('id'))
+    .order_by('minute')
+)
+throughput_data = [
+    {"minute": item["minute"].isoformat(), "count": item["count"]}
+    for item in throughput
+]
+# Added to Response:
+"throughput": throughput_data
+```
+
+### `backend/jobs/tasks.py` — send_stats_update()
+
+Two fixes:
+
+1. Replaced placeholder `Job.objects.aggregate(...)` with actual aggregate expressions (was causing `TypeError: QuerySet.aggregate() received non-expression(s): Ellipsis`).
+2. Added same `TruncMinute` throughput query and included `'throughput': throughput_data` in WS push payload.
+
+```python
+status_counts = Job.objects.aggregate(
+    total_jobs=Count('id'),
+    pending_count=Count('id', filter=Q(status='PENDING')),
+    running_count=Count('id', filter=Q(status='RUNNING')),
+    completed_count=Count('id', filter=Q(status='COMPLETED')),
+    failed_count=Count('id', filter=Q(status='FAILED')),
+    dead_count=Count('id', filter=Q(status='DEAD')),
+)
+
+throughput = (
+    Job.objects
+    .filter(completed_at__gte=now - timedelta(hours=1), status='COMPLETED')
+    .annotate(minute=TruncMinute('completed_at'))
+    .values('minute')
+    .annotate(count=Count('id'))
+    .order_by('minute')
+)
+throughput_data = [
+    {"minute": item["minute"].isoformat(), "count": item["count"]}
+    for item in throughput
+]
+
+send_ws('status', {
+    'type': 'stats_update',
+    'data': {
+        **status_counts,
+        'throughput': throughput_data,
+        ...
+    }
+})
+```
+
+### `frontend/src/components/ThroughputChart.tsx` — New File
+
+Custom SVG line chart (no recharts — incompatible with React 19). Receives `data: {minute: string, count: number}[]`. Maps each point to SVG coordinates using linear scaling. Draws axes and polyline.
+
+```tsx
+const x = padX + (i / (data.length - 1)) * (width - padX * 2);
+const y = padY + (1 - d.count / maxCount) * (height - padY * 2);
+```
+
+First and last minute labels on X-axis. Max count label on Y-axis.
+
+### `frontend/src/pages/Dashboard.tsx`
+
+- Added `ThroughputPoint` interface and `throughput` field to `Stats` interface.
+- Fixed WS `onmessage` to read `msg.data` instead of spreading `msg` directly (WS envelope is `{type, data: {...}}`).
+- Imported and rendered `<ThroughputChart data={stats.throughput ?? []} />`.
+
+### `frontend/src/pages/JobList.tsx` — handleSubmit
+
+Added `idempotency_key: crypto.randomUUID()` per submission so each button click generates a unique key, allowing multiple jobs of the same type to be submitted without hitting the idempotency block.
+
+```typescript
+const payload = {
+  ...job,
+  idempotency_key: crypto.randomUUID(),
+};
+```
+
+### `backend/jobs/consumers.py` — JobStatusConsumer
+
+Fixed `disconnect()` signature — was missing `close_code` argument, causing `TypeError` on WS disconnect.
+
+```python
+async def disconnect(self, close_code):
+    await self.channel_layer.group_discard(self.group_name, self.channel_name)
+```
+
+---
+
+## Bugs Hit
+
+**Bug 1: `throughput` always empty array**  
+Root cause: All existing completed jobs had `completed_at=None` — they were zombie jobs completed before `completed_at` was being set, or submitted with duplicate `idempotency_key=None`.  
+Fix: Submitted fresh jobs with unique idempotency keys; jobs completed normally and populated `completed_at`.
+
+**Bug 2: `TypeError: QuerySet.aggregate() received non-expression(s): Ellipsis`**  
+Root cause: `send_stats_update()` in `tasks.py` had placeholder `Job.objects.aggregate(...)` — literal `...` was passed as argument.  
+Fix: Replaced with full aggregate expressions matching `StatsView`.
+
+**Bug 3: Worker not picking up jobs**  
+Root cause: Frontend was sending `idempotency_key` as `undefined` (not in payload), so all jobs matched the first job with `idempotency_key=None`. Idempotency check returned existing job before `apply_async` was called.  
+Fix: Added `crypto.randomUUID()` in `handleSubmit`.
+
+**Bug 4: `TypeError: JobStatusConsumer.disconnect() takes 1 positional argument but 2 were given`**  
+Root cause: `disconnect` method signature missing `close_code` parameter.  
+Fix: Added `close_code` parameter.
+
+**Bug 5: `TruncMinute` result not JSON-serializable**  
+Root cause: `TruncMinute` returns Python `datetime` objects; DRF cannot serialize them directly.  
+Fix: `.isoformat()` on each `minute` value in list comprehension.
+
+---
+
+## Verified Output
+
+`/api/stats/` response includes:
+
+```json
+"throughput": [
+    {"minute": "2026-05-02T06:05:00+00:00", "count": 2}
+]
+```
+
+Dashboard renders SVG line chart with cyan polyline, axes, and time labels. Chart updates live via WebSocket as jobs complete.
+
+---
+
+## Status
+
+S7 complete — job throughput chart live on dashboard via WebSocket push. ✅

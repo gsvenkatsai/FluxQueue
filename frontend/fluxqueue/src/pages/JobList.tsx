@@ -32,7 +32,11 @@ const JobList = () => {
   });
 
   const handleSubmit = () => {
-    axios.post<Job>("http://127.0.0.1:8000/api/jobs/", job).then((res) => {
+    const payload = {
+      ...job,
+      idempotency_key: crypto.randomUUID(),
+    };
+    axios.post<Job>("http://127.0.0.1:8000/api/jobs/", payload).then((res) => {
       setJobs([res.data, ...jobs]);
       setShowForm(false);
     });
