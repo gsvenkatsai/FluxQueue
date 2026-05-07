@@ -1,6 +1,6 @@
 import random
 import traceback
-
+import os
 from celery import current_app, shared_task
 
 from .models import Job, JobDLQ, JobLog, QueueMetric
@@ -79,7 +79,7 @@ def send_stats_update():
         for item in throughput
         ] 
     import redis
-    r = redis.Redis(host='127.0.0.1', port=6379, db=0)
+    r = redis.Redis(host=os.environ.get('REDIS_HOST', '127.0.0.1'), port=6379, db=0)
     queue_depth_high = r.llen('high_priority')
     queue_depth_default = r.llen('default')
     queue_depth_low = r.llen('low_priority')

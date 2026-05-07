@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 from django.utils import timezone
 from rest_framework.generics import ListCreateAPIView, RetrieveAPIView, ListAPIView
@@ -135,7 +136,7 @@ class StatsView(APIView):
             for item in throughput
         ]
         import redis
-        r = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        r = redis.Redis(host=os.environ.get('REDIS_HOST', '127.0.0.1'), port=6379, db=0)
         queue_depth_high = r.llen('high_priority')
         queue_depth_default = r.llen('default')
         queue_depth_low = r.llen('low_priority')

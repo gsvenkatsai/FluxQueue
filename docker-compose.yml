@@ -15,5 +15,70 @@ services:
     ports:
       - "6379:6379"
 
+  backend:
+    build: ./backend
+    command: daphne -b 0.0.0.0 -p 8000 fluxqueue.asgi:application
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
+      - DB_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: ./backend
+    command: celery -A fluxqueue worker -Q high_priority,default,low_priority --prefetch-multiplier=1 -n worker1@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
+      - DB_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+    depends_on:
+      - db
+      - redis
+
+  worker_high:
+    build: ./backend
+    command: celery -A fluxqueue worker -Q high_priority --prefetch-multiplier=1 -n worker2@%h
+    volumes:
+      - ./backend:/app
+    environment:
+      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
+      - DB_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+    depends_on:
+      - db
+      - redis
+
+  beat:
+    build: ./backend
+    command: celery -A fluxqueue beat --loglevel=info
+    volumes:
+      - ./backend:/app
+    environment:
+      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
+      - DB_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+    depends_on:
+      - db
+      - redis
+
+  frontend:
+    build: ./frontend/fluxqueue
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
