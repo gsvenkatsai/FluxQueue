@@ -2,6 +2,7 @@ import random
 import traceback
 
 from celery import current_app, shared_task
+
 from .models import Job, JobDLQ, JobLog, QueueMetric
 from django.utils import timezone
 from .handlers import handle_dlq_test, handle_email, handle_pdf, handle_image, handle_export
@@ -16,7 +17,8 @@ from django.utils import timezone
 from datetime import timedelta
 
 from django.db.models.functions import TruncMinute
-
+# views.py and tasks.py
+from .utils import get_queue_for_priority
 def send_ws(group_name, data):
     channel_layer = get_channel_layer()
     async_to_sync(channel_layer.group_send)(group_name, data)
@@ -75,7 +77,12 @@ def send_stats_update():
     throughput_data = [
         {"minute": item["minute"].isoformat(), "count": item["count"]}
         for item in throughput
-        ]    
+        ] 
+    import redis
+    r = redis.Redis(host='127.0.0.1', port=6379, db=0)
+    queue_depth_high = r.llen('high_priority')
+    queue_depth_default = r.llen('default')
+    queue_depth_low = r.llen('low_priority')
     send_ws('status', {
         'type': 'stats_update',
         'data': {
@@ -84,7 +91,10 @@ def send_stats_update():
             'avg_exec':avg_exec_ms,
             'avg_exec_per_type':avg_exec_per_type,
             'failure_rate':failure_rate,
-            'workers': workers_health
+            'workers': workers_health,
+            'queue_depth_high': queue_depth_high,
+            'queue_depth_default': queue_depth_default,
+            'queue_depth_low': queue_depth_low,
         }
     })
 
@@ -193,7 +203,11 @@ def detect_zombie_jobs():
             job.save()
             JobLog.objects.create(job=job, level='WARNING', message='Zombie detected — requeuing')
             send_status(str(job.id), 'PENDING')
-            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+            execute_job.apply_async(
+                (str(job.id),),
+                soft_time_limit=job.timeout_seconds,
+                queue=get_queue_for_priority(job.priority),
+            )
 
 
 @shared_task

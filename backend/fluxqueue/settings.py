@@ -181,3 +181,11 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': timedelta(seconds=30)
     }
 }
+
+from kombu import Queue
+CELERY_TASK_QUEUES = (
+    Queue('high_priority'),
+    Queue('default'),
+    Queue('low_priority'),
+)
+CELERY_TASK_DEFAULT_QUEUE = 'default'

@@ -7,6 +7,8 @@ from rest_framework import status
 from .models import Job, JobDLQ, QueueMetric
 from .serializers import JobDLQSerializer, JobSerializer, JobListSerializer, JobDetailSerializer
 from .tasks import execute_job
+# views.py and tasks.py
+from .utils import get_queue_for_priority
 from celery.exceptions import OperationalError
 
 from celery.app import app_or_default
@@ -15,23 +17,28 @@ celery_app = app_or_default()
 class JobDetailView(RetrieveAPIView):
     queryset = Job.objects.all()
     serializer_class = JobDetailSerializer
-
+   
 class JobView(ListCreateAPIView):
     queryset = Job.objects.all()
     def get_serializer_class(self):
         if self.request.method == 'POST':
             return JobSerializer
         return JobListSerializer
+    
     def post(self, request):
         serializer = JobSerializer(data=request.data)
-        old_job = Job.objects.filter(idempotency_key=request.data.get('idempotency_key')).first()
-        if old_job is not None and old_job.status != 'FAILED':
-            return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
+        idempotency_key = request.data.get('idempotency_key')
+        if idempotency_key:
+            old_job = Job.objects.filter(idempotency_key=idempotency_key).first()
+            if old_job is not None and old_job.status != 'FAILED':
+                return Response(JobSerializer(old_job).data, status=status.HTTP_200_OK)
         if serializer.is_valid():
             job = serializer.save()
             try:
                 print("BEFORE DELAY", job.id)
-                execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+                execute_job.apply_async((str(job.id),), 
+                                        soft_time_limit=job.timeout_seconds,
+                                        queue=get_queue_for_priority(job.priority))
                 print("AFTER DELAY")
             except (OperationalError, RuntimeError):
                 job.delete()
@@ -55,7 +62,11 @@ class JobRequeueView(APIView):
             jobdlq.job.save()
             job = jobdlq.job
             jobdlq.delete()
-            execute_job.apply_async((str(job.id),), soft_time_limit=job.timeout_seconds)
+            execute_job.apply_async(
+                (str(job.id),),
+                soft_time_limit=job.timeout_seconds,
+                queue=get_queue_for_priority(job.priority),
+            )
             return Response(JobSerializer(job).data, status=status.HTTP_201_CREATED)
         except JobDLQ.DoesNotExist :
             return Response({"error": "DLQ entry not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -123,6 +134,11 @@ class StatsView(APIView):
             {"minute": item["minute"].isoformat(), "count": item["count"]}
             for item in throughput
         ]
+        import redis
+        r = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        queue_depth_high = r.llen('high_priority')
+        queue_depth_default = r.llen('default')
+        queue_depth_low = r.llen('low_priority')
         return Response({
             **status_counts,
             "throughput" : throughput_data,
@@ -134,4 +150,7 @@ class StatsView(APIView):
             "queue_depth": queue_depth,
             "active_workers": active_workers,
             "jobs_per_minute": jobs_per_minute,
+            "queue_depth_high": queue_depth_high,
+            "queue_depth_default": queue_depth_default,
+            "queue_depth_low": queue_depth_low,
         })

@@ -22,6 +22,6 @@ def handle_image(job):
 
 def handle_export(job):
     may_be_choas()
-    time.sleep(7)
+    time.sleep(30)  # change this
     return {"status": "data exported " + job.payload.get("table")}
 
