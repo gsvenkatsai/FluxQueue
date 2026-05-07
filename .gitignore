@@ -4,4 +4,11 @@ __pycache__/
 db.sqlite3
 *.log
 node_modules/
-.env.*
+.env.*venv/
+*.egg-info/
+dist/
+build/
+celerybeat-schedule
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+.DS_Store

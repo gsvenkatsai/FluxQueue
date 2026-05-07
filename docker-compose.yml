@@ -1,10 +1,7 @@
 services:
   db:
     image: postgres:15
-    environment:
-      POSTGRES_DB: fluxqueue
-      POSTGRES_USER: fluxuser
-      POSTGRES_PASSWORD: fluxpass
+    env_file: .env
     ports:
       - "5432:5432"
     volumes:
@@ -22,11 +19,7 @@ services:
       - ./backend:/app
     ports:
       - "8000:8000"
-    environment:
-      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
-      - DB_HOST=db
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_HOST=redis
+    env_file: .env
     depends_on:
       - db
       - redis
@@ -36,11 +29,7 @@ services:
     command: celery -A fluxqueue worker -Q high_priority,default,low_priority --prefetch-multiplier=1 -n worker1@%h
     volumes:
       - ./backend:/app
-    environment:
-      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
-      - DB_HOST=db
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_HOST=redis
+    env_file: .env
     depends_on:
       - db
       - redis
@@ -50,11 +39,7 @@ services:
     command: celery -A fluxqueue worker -Q high_priority --prefetch-multiplier=1 -n worker2@%h
     volumes:
       - ./backend:/app
-    environment:
-      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
-      - DB_HOST=db
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_HOST=redis
+    env_file: .env
     depends_on:
       - db
       - redis
@@ -64,11 +49,7 @@ services:
     command: celery -A fluxqueue beat --loglevel=info
     volumes:
       - ./backend:/app
-    environment:
-      - DJANGO_SETTINGS_MODULE=fluxqueue.settings
-      - DB_HOST=db
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_HOST=redis
+    env_file: .env
     depends_on:
       - db
       - redis
